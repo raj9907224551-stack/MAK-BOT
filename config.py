@@ -3,7 +3,7 @@
 # Payment credentials are intentionally NOT stored in code; they are managed
 # from the Admin Panel and saved in data/settings.json.
 
-BOT_TOKEN = "8880977241:AAFsylEBnYHeHF9ylyW8zE2D20LGoatxZbc"
+BOT_TOKEN = "8880977241:AAEenynPrHA4zDKbLABvEn0x0whlnA-0tPA"
 ADMIN_IDS = {
     6739795427,
 }
