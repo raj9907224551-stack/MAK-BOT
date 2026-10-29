@@ -1,0 +1,44 @@
+RG Admin Panel – requested fixes
+
+1. Admin navigation
+- One-level Back navigation is now backed by a shared snapshot history.
+- Direct-rendered Admin screens are also recorded, fixing Back from screens such as Button Colors and Premium Design.
+- Legacy admin_back_main callbacks continue to work, but now restore the previous Admin screen when history exists.
+- Back controls are normalized to the final row of the keyboard.
+- Existing controls/callbacks are preserved; only navigation handling/layout was improved.
+
+2. Product / Plan dynamic UI
+- Product lists are generated from the current database.
+- Plan lists are generated from the selected Product.
+- New Products/Plans automatically appear without hard-coded button additions.
+- Product Button Color and individual Plan Button Color remain separated.
+
+3. Premium Emoji / Premium Design
+- Product list is dynamic.
+- Each Product's Plans are dynamic.
+- Each Plan can have its own Premium custom emoji.
+- Premium emoji applies only to the selected Plan button.
+- Back navigation from the Premium emoji input returns to the selected Product's Plan list.
+
+4. Per-user Product Plan Custom Price
+- Existing per-user/per-plan custom price system is preserved.
+- User/Chat ID + Product + individual Plan can have separate User Price and Reseller Price overrides.
+- Standard price is retained when an override is cleared.
+
+5. Manage Key / Edit system
+- Existing manual/VIP key edit functionality is preserved, including duplicate-key protection.
+- Product/Hack edit flow remains available for name, prices and plan/duration editing.
+
+6. Existing Admin panel
+- No additional Admin feature buttons were removed by this update.
+- The existing Bot & Backups section remains available.
+
+7. Admin Back-button hardening (latest)
+- Fixed the next-step Back-button wrapper to identify the admin by private chat ID; outgoing bot prompts do not have the admin in message.from_user.
+- Product creation prompts now retain one-level Admin Back navigation through the full name → duration → user price → reseller price flow.
+- Product creation now returns to the Product & Plans hub from Back instead of falling to the Main Admin Panel.
+- Product-added success screen keeps a dedicated final-row Product & Plans Back button.
+- The four User Panel Back buttons remain present in both Button Colors and All Button Emoji catalogs.
+- All Button Emoji keeps the requested two-column catalog layout.
+- Existing backup entries in the Backup Center now have a clearly visible Download Backup button directly underneath each listed archive.
+- No existing Product, Plan, User, Payment, API, or User Panel feature was intentionally removed.
