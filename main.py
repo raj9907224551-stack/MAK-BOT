@@ -8,7 +8,6 @@ import time
 import threading
 import concurrent.futures
 import os
-import sys
 import hashlib
 import hmac
 import html
@@ -26,7 +25,6 @@ import zipfile
 import tarfile
 import tempfile
 from pathlib import Path
-from decimal import Decimal, InvalidOperation
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -39,10 +37,6 @@ try:
     from cryptography.hazmat.primitives.ciphers import Cipher as _CryptoCipher, algorithms as _crypto_algorithms, modes as _crypto_modes
     _PAYTM_CRYPTO_AVAILABLE = True
 except Exception:
-    _crypto_padding = None
-    _CryptoCipher = None
-    _crypto_algorithms = None
-    _crypto_modes = None
     _PAYTM_CRYPTO_AVAILABLE = False
 
 # QR styling/decoding dependencies. The payment gateway and verification flow
@@ -51,8 +45,7 @@ import qrcode
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer, SquareModuleDrawer
 from qrcode.image.styles.colormasks import SolidFillColorMask
-from qrcode.constants import ERROR_CORRECT_M
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 # cv2/numpy are imported lazily inside QR decoding so multiple created bots
 # can start without each process paying the full OpenCV memory cost.
 
@@ -1066,11 +1059,6 @@ checkout_prepare_state = {}
 wallet_processing_state = set()
 wallet_processing_lock = threading.Lock()
 
-# A per-order guard prevents two rapid reset taps from sending duplicate
-# charge/quota-affecting reset POSTs to the Licence Panel Hub.
-licence_reset_processing = set()
-licence_reset_processing_lock = threading.Lock()
-
 # Per-user Add Balance keypad state.
 topup_keypad_state = {}
 user_checkout_temp = {}
@@ -1184,20 +1172,6 @@ def init_db():
             date_time TEXT
         )
     ''')
-    # Additive metadata for Licence Panel Hub delivery and key resets. Existing
-    # purchase history remains intact; older rows simply stay ineligible for
-    # provider resets until a new Hub order is recorded.
-    for column_sql in (
-        "ALTER TABLE order_history ADD COLUMN plan_id INTEGER DEFAULT 0",
-        "ALTER TABLE order_history ADD COLUMN delivery_source TEXT DEFAULT ''",
-        "ALTER TABLE order_history ADD COLUMN purchased_at TEXT DEFAULT ''",
-        "ALTER TABLE order_history ADD COLUMN reset_count INTEGER DEFAULT 0",
-        "ALTER TABLE order_history ADD COLUMN last_reset_at TEXT DEFAULT ''",
-    ):
-        try:
-            cursor.execute(column_sql)
-        except Exception:
-            pass
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
@@ -1229,11 +1203,11 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS payment_gateways (gateway TEXT PRIMARY KEY, upi_id TEXT NOT NULL DEFAULT '', merchant_id TEXT NOT NULL DEFAULT '', merchant_key TEXT NOT NULL DEFAULT '', connected INTEGER NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '')")
     cursor.execute('INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,1,?)',('fam',RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY,datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     cursor.execute("UPDATE payment_gateways SET upi_id=?,merchant_id=?,merchant_key=? WHERE gateway='fam' AND (upi_id='' OR merchant_id='')",(RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY))
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('active_payment_gateway','')")
-    cursor.execute("UPDATE settings SET value='' WHERE key='active_payment_gateway' AND value='zyvo'")
+    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('active_payment_gateway','fam')")
     cursor.execute("INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,0,?)",('paytm','','','',datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_pos_id','')")
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_client_id',?)",(PAYTM_DEFAULT_CLIENT_ID,))
+    cursor.execute("UPDATE settings SET value='fam' WHERE key='active_payment_gateway'")
     # Admin-controlled runtime settings. Defaults preserve the bot's current behavior.
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('bot_enabled','1')")
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('telegram_support_id',?)",(TELEGRAM_USER,))
@@ -1392,45 +1366,6 @@ def init_db():
             updated_at TEXT
         )
     ''')
-    # Licence Panel Hub credentials and mappings are stored separately from
-    # the existing New API server registry because the Hub has a distinct REST
-    # contract (/products, /stock, /order, /reset-key).
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS licence_api_settings (
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            api_key TEXT NOT NULL DEFAULT '',
-            base_url TEXT NOT NULL DEFAULT 'https://licencepanelhub.shop/api/v1'
-        )
-    ''')
-    cursor.execute("""
-        INSERT OR IGNORE INTO licence_api_settings(id,api_key,base_url)
-        VALUES(1,'','https://licencepanelhub.shop/api/v1')
-    """)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS licence_product_map (
-            external_product_id TEXT PRIMARY KEY,
-            local_product_name TEXT NOT NULL DEFAULT '',
-            updated_at TEXT DEFAULT ''
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS licence_plan_map (
-            local_plan_id INTEGER PRIMARY KEY,
-            external_product_id TEXT NOT NULL,
-            variant_id TEXT NOT NULL UNIQUE,
-            updated_at TEXT DEFAULT ''
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS licence_product_reset_settings (
-            product_name TEXT PRIMARY KEY,
-            reset_id TEXT NOT NULL DEFAULT '',
-            service_name TEXT NOT NULL DEFAULT '',
-            verified INTEGER NOT NULL DEFAULT 0,
-            checked_at TEXT NOT NULL DEFAULT ''
-        )
-    ''')
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('licence_reset_enabled','1')")
     for index_sql in (
         "CREATE INDEX IF NOT EXISTS idx_api_servers_enabled ON api_servers(enabled)",
         "CREATE INDEX IF NOT EXISTS idx_api_server_products_product ON api_server_products(product_name)",
@@ -1902,100 +1837,115 @@ def _get_active_payment_gateway(): return (get_setting('active_payment_gateway')
 
 def _set_active_payment_gateway(gateway):
     gateway=str(gateway or '').lower().strip()
-    if not gateway:
+    if gateway not in {'fam','paytm'}:
         set_setting('active_payment_gateway',''); return True
-    if gateway not in {'fam','paytm'}: return False
     row=_gateway_row(gateway)
     if not row or not row[1] or not row[2] or not int(row[4] or 0): return False
     set_setting('active_payment_gateway',gateway); return True
 
 def _gateway_status_line(gateway):
-    row=_gateway_row(str(gateway).lower())
-    if not row or not (row[1] and row[2]):
+    row=_gateway_row('fam' if str(gateway).lower() == 'fam' else gateway)
+    if not row or not row[1] or not row[2]:
         return 'NOT CONFIGURED'
     return 'CONNECTED' if int(row[4] or 0) else 'NOT CONNECTED'
 
 
 
-def _fam_base_url():
-    raw = str(BASE_GATEWAY_URL or '').strip().rstrip('/') or 'https://fampaygateway.site'
+
+
+
+
+
+
+
+def _fam_gateway_base_candidates():
+    """Return compatible FamGateway base URLs without duplicating /api."""
+    raw = str(BASE_GATEWAY_URL or '').strip().rstrip('/')
+    if not raw:
+        raw = 'https://famgateway.in/api'
+    candidates = [raw]
     if raw.lower().endswith('/api'):
-        raw = raw[:-4].rstrip('/')
-    parsed = urllib.parse.urlparse(raw)
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
-        raise RuntimeError('Invalid FamPay gateway URL.')
-    return raw
+        candidates.append(raw[:-4].rstrip('/'))
+    elif raw.lower().endswith('/api/'):
+        candidates.append(raw[:-5].rstrip('/'))
+    return list(dict.fromkeys(candidates))
 
-def _fam_credentials():
+
+def _fam_endpoint_candidates(base, endpoint):
+    base = str(base or '').rstrip('/')
+    endpoint = str(endpoint or '').lstrip('/')
+    urls = [f'{base}/{endpoint}']
+    if not base.lower().endswith('/api'):
+        urls.append(f'{base}/api/{endpoint}')
+    return list(dict.fromkeys(urls))
+
+
+def _legacy_check_fam_connection():
     row = _gateway_row('fam')
-    key = str((row[2] if row and row[2] else (row[3] if row and row[3] else FAM_API_KEY)) or '').strip()
-    upi = str((row[1] if row and row[1] else RECEIVER_UPI) or '').strip()
-    return upi, key
-
-def _fam_message(data):
-    if isinstance(data, dict):
-        for k in ('message', 'error', 'msg', 'detail'):
-            v = data.get(k)
-            if isinstance(v, str) and v.strip():
-                return re.sub(r'[^\x20-\x7E]', ' ', v.strip())[:200]
-    return ''
-
-def _fam_amount_equals(value, expected):
-    try:
-        a = Decimal(str(value)); b = Decimal(str(expected))
-        return a.is_finite() and b.is_finite() and a > 0 and a == b
-    except (InvalidOperation, TypeError, ValueError):
-        return False
-
-def _fam_get(name, params, timeout=10):
-    """GET https://<gateway>/api/<name>. Returns (http_status, json_dict, error)."""
-    try:
-        url = f"{_fam_base_url()}/api/{name}"
-        res = HTTP_SESSION.get(url, params=params, timeout=timeout, allow_redirects=False)
-    except RuntimeError as exc:
-        return None, {}, str(exc)
-    except requests.RequestException as exc:
-        # Only the exception type is logged: the message could contain the API token.
-        print(f'[FAMPAY] {name} network error: {type(exc).__name__}')
-        return None, {}, 'FamPay gateway is not reachable. Please try again.'
-    try:
-        data = res.json()
-    except Exception:
-        data = {}
-    return res.status_code, (data if isinstance(data, dict) else {}), None
-
-def _check_fam_connection():
-    upi, key = _fam_credentials()
-    if not upi or not key:
+    if not row or not row[1] or not row[2]:
+        return False, 'FAMP UPI ID and API token are required.'
+    key = str(row[2] or row[3] or FAM_API_KEY).strip()
+    if not key:
         _set_gateway_connected('fam', False)
-        return False, 'FamPay UPI ID and API token are required.'
-    # Verifying a deliberately non-existent order proves the token is accepted
-    # without creating a real payment order.
+        return False, 'FAMP API token is missing.'
+
+    # A verification request for a deliberately non-existent order is enough to
+    # validate authentication without creating/charging a real payment order.
     dummy = 'CONNECTION_TEST_' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '_' + secrets.token_hex(3)
-    status, data, err = _fam_get('verify.php', {'order_id': dummy, 'api_key': key}, timeout=10)
-    if err:
-        _set_gateway_connected('fam', False)
-        return False, err
-    msg = _fam_message(data)
-    st = str(data.get('status') or '').lower()
-    text = (msg + ' ' + st).lower()
-    if status in (401, 403):
-        _set_gateway_connected('fam', False)
-        return False, msg or 'FamPay rejected the API token.'
-    if status is not None and status >= 500:
-        _set_gateway_connected('fam', False)
-        return False, 'FamPay gateway is temporarily unavailable.'
-    order_unknown = (st in {'not_found', 'pending', 'expired'}
-                     or any(x in text for x in ('not found', 'not_found', 'does not exist', 'no such order')))
-    if not order_unknown and any(x in text for x in ('invalid api', 'api key', 'api_key', 'unauthor', 'forbidden', 'invalid key', 'invalid token')):
-        _set_gateway_connected('fam', False)
-        return False, msg or 'FamPay rejected the API token.'
-    if not data:
-        _set_gateway_connected('fam', False)
-        return False, f'FamPay did not return a valid response (HTTP {status}). Check the gateway URL.'
-    _set_gateway_connected('fam', True)
-    return True, 'FamPay API token verified successfully.'
+    last_detail = 'No response from gateway.'
+    auth_seen = False
+    try:
+        for base in _fam_gateway_base_candidates():
+            for endpoint in ('verify-order.php', 'verify.php'):
+                for url in _fam_endpoint_candidates(base, endpoint):
+                    try:
+                        res = HTTP_SESSION.get(
+                            url,
+                            params={'order_id': dummy, 'api_key': key},
+                            timeout=8,
+                        )
+                        last_detail = f'HTTP {res.status_code}'
+                        try:
+                            data = res.json()
+                        except Exception:
+                            data = {}
+                        status = str(data.get('status') or '').lower() if isinstance(data, dict) else ''
+                        message = str(data.get('message') or status or last_detail)[:300]
+                        last_detail = message
 
+                        if res.status_code in (401, 403):
+                            _set_gateway_connected('fam', False)
+                            return False, message or 'Invalid or unauthorized API token.'
+
+                        # Official FamGateway returns 404 for a non-existent
+                        # order. That is an authenticated response and therefore
+                        # proves the API key is accepted without creating an order.
+                        if res.status_code == 404:
+                            text = json.dumps(data, ensure_ascii=False).lower() if isinstance(data, dict) else ''
+                            if any(x in text for x in ('not_found', 'order_id', 'order not', 'does not exist')):
+                                auth_seen = True
+                                continue
+
+                        if 200 <= res.status_code < 300:
+                            auth_seen = True
+                            if status in {'success', 'pending', 'expired', 'not_found', 'error'} or isinstance(data, dict):
+                                continue
+
+                        if res.status_code >= 500:
+                            continue
+                    except requests.RequestException as exc:
+                        last_detail = str(exc)[:300]
+                        continue
+
+        if auth_seen:
+            _set_gateway_connected('fam', True)
+            return True, 'API token verified successfully.'
+
+        _set_gateway_connected('fam', False)
+        return False, last_detail
+    except Exception as e:
+        _set_gateway_connected('fam', False)
+        return False, str(e)[:300]
 
 def _paytm_json_compact(value):
     # Paytm's published Python examples sign json.dumps(body) and then send the
@@ -2008,8 +1958,7 @@ def _paytm_checksum_generate(body_string, merchant_key):
     Paytm's published checksum flow uses SHA-256(body|salt)+salt and encrypts
     the result with AES-128-CBC using the fixed Paytm IV.
     """
-    if (not _PAYTM_CRYPTO_AVAILABLE or _crypto_padding is None or _CryptoCipher is None
-            or _crypto_algorithms is None or _crypto_modes is None):
+    if not _PAYTM_CRYPTO_AVAILABLE:
         raise RuntimeError(
             'Paytm crypto dependency is missing. Add cryptography to requirements.txt '
             'and restart the bot.'
@@ -2031,8 +1980,7 @@ def _paytm_checksum_generate(body_string, merchant_key):
 
 def _paytm_checksum_verify(body_string, merchant_key, checksum):
     """Verify a Paytm response signature when one is returned."""
-    if (not _PAYTM_CRYPTO_AVAILABLE or _crypto_padding is None or _CryptoCipher is None
-            or _crypto_algorithms is None or _crypto_modes is None):
+    if not _PAYTM_CRYPTO_AVAILABLE:
         return False
     key = str(merchant_key or '').strip()
     if len(key.encode('utf-8')) != 16 or not checksum:
@@ -2066,222 +2014,307 @@ def _paytm_config():
     }
 
 def _paytm_payment_config_error():
-    """Return the missing configuration needed to create Paytm Dynamic QR orders.
-
-    Connection/authentication and payment-readiness are intentionally separate:
-    Transaction Status authentication needs MID + Merchant Key, while Dynamic QR
-    creation additionally needs the merchant-configured POS ID and Client ID.
-    This prevents the admin's Check Connection button from reporting a false
-    failure just because Dynamic QR has not been configured yet.
-    """
-    cfg = _paytm_config()
-    if not cfg['merchant_key']:
-        return 'Paytm Merchant Key is required for API authentication and automatic payment verification.'
-    if not cfg['pos_id']:
-        return 'Paytm POS ID is required for Dynamic QR payments. Enter the POS ID configured in your Paytm merchant account.'
-    if not cfg['client_id']:
-        return 'Paytm Client ID is required for Dynamic QR payments.'
-    if not _PAYTM_CRYPTO_AVAILABLE:
-        return 'Missing Python dependency: cryptography. Add cryptography to requirements.txt and restart the bot.'
+    cfg = _zyvopay_config() if '_zyvopay_config' in globals() else {'upi_id':'','api_key':''}
+    if not cfg.get('upi_id'):
+        return 'UPI ID is required.'
+    try:
+        _zyvopay_signing_key(cfg.get('api_key',''))
+    except Exception:
+        return 'A complete ZYVO PAY public.secret API token is required.'
     return ''
 
-def _check_paytm_connection():
-    """Verify Paytm API authentication without creating/charging a payment.
+# PayTM-labelled admin tile now connects to ZYVO PAY (merchant dashboard API).
+ZYVOPAY_BASE_URL = os.getenv('ZYVOPAY_BASE_URL', 'https://zyvopay.site/api').strip().rstrip('/')
+ZYVOPAY_ORDER_META = {}
 
-    A deliberately unused order ID is sent to the official Transaction Status
-    API. UPI ID is stored for display/payment context, but UPI ID + MID alone
-    cannot authenticate server-to-server Paytm API calls: Merchant Key is
-    required. POS ID and Client ID are checked later when Paytm Dynamic QR is
-    actually enabled/used.
-    """
-    cfg = _paytm_config()
-    if not cfg['upi_id'] or not cfg['mid']:
-        _set_gateway_connected('paytm',False)
-        return False,'Paytm UPI ID and Merchant ID are required.'
-    if not cfg['merchant_key']:
-        _set_gateway_connected('paytm',False)
-        return False,'Paytm Merchant Key is required. UPI ID + Merchant ID alone cannot verify Paytm API credentials or auto-verify payments.'
-    if not _PAYTM_CRYPTO_AVAILABLE:
-        _set_gateway_connected('paytm',False)
-        return False,'Missing Python dependency: cryptography. Add cryptography to requirements.txt and restart the bot.'
+def _zyvopay_config(gateway='paytm'):
+    row = _gateway_row(gateway)
+    api_key = ''
+    if row:
+        api_key = str(row[3]).strip() if row[3] else (str(row[2]).strip() if gateway == 'fam' and row[2] else '')
+    return {
+        'upi_id': str(row[1]).strip() if row and row[1] else '',
+        'api_key': api_key,
+        'connected': bool(int(row[4] or 0)) if row else False,
+    }
 
-    order_id = 'RGTEST' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + str(random.randint(1000,9999))
-    body = {'mid': cfg['mid'], 'orderId': order_id}
-    body_text = _paytm_json_compact(body)
+def _zyvopay_signing_key(api_key):
+    # Dashboard token is public.secret. Split only at the first period.
+    if not isinstance(api_key, str) or '.' not in api_key:
+        raise RuntimeError('Invalid ZYVO PAY API token. Paste the complete public.secret token from the dashboard.')
+    public, secret = api_key.split('.', 1)
+    if not public or not secret:
+        raise RuntimeError('Invalid ZYVO PAY API token format.')
+    return secret
 
-    try:
-        signature = _paytm_checksum_generate(body_text, cfg['merchant_key'])
-        payload = {'body': body, 'head': {'signature': signature}}
-        res = HTTP_SESSION.post(
-            PAYTM_STATUS_URL,
-            data=_paytm_json_compact(payload),
-            headers={'Content-Type':'application/json'},
-            timeout=12,
-        )
+def _zyvopay_request(method, endpoint, payload=None, retries=2, gateway='paytm'):
+    cfg = _zyvopay_config(gateway)
+    api_key = cfg['api_key']
+    secret = _zyvopay_signing_key(api_key)
+    body = '' if method.upper() == 'GET' else json.dumps(payload or {}, ensure_ascii=False, separators=(',', ':'))
+    timestamp = str(int(time.time()))
+    signature = hmac.new(secret.encode('utf-8'), (timestamp + '.' + body).encode('utf-8'), hashlib.sha256).hexdigest()
+    headers = {'Content-Type':'application/json','X-API-Key':api_key,'X-Timestamp':timestamp,'X-Signature':signature}
+    url = ZYVOPAY_BASE_URL + '/' + endpoint.lstrip('/')
+    last_error = 'ZYVO PAY request failed.'
+    for attempt in range(max(0, int(retries)) + 1):
         try:
-            data = res.json()
-        except Exception:
-            data = {}
-        body_res = data.get('body') if isinstance(data, dict) else {}
-        result_info = body_res.get('resultInfo') if isinstance(body_res, dict) else {}
-        code = str((result_info or {}).get('resultCode') or '')
-        status = str((result_info or {}).get('resultStatus') or '')
-        message = str((result_info or {}).get('resultMsg') or '').strip()
+            response = HTTP_SESSION.request(method.upper(), url, data=(body if method.upper() != 'GET' else None), headers=headers, timeout=(5, 18))
+            try: data = response.json()
+            except Exception: data = {}
+            if response.status_code < 400 and isinstance(data, dict):
+                return data
+            # Only retry server errors / throttling; never retry auth or validation errors.
+            message = data.get('message') if isinstance(data, dict) else None
+            last_error = 'ZYVO PAY API error (HTTP %s)%s' % (response.status_code, ': ' + str(message)[:180] if message else '')
+            if response.status_code < 500 and response.status_code != 429:
+                break
+            if attempt >= retries: break
+            time.sleep(0.4 * (attempt + 1))
+        except requests.RequestException:
+            last_error = 'Could not reach ZYVO PAY. Please try again.'
+            if attempt >= retries: break
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(last_error)
 
-        # 331 = NO_RECORD_FOUND for the deliberately unused order ID. That is a
-        # successful credential/authentication check, not a payment failure.
-        auth_failure_codes = {'2005','335','2013','2014'}
-        ok = res.status_code < 500 and code not in auth_failure_codes and isinstance(body_res, dict) and bool(result_info)
-        if ok:
-            response_signature = (data.get('head') or {}).get('signature') if isinstance(data, dict) else None
-            if response_signature:
-                response_body_text = _paytm_json_compact(body_res)
-                if not _paytm_checksum_verify(response_body_text, cfg['merchant_key'], response_signature):
-                    ok = False
-                    message = 'Paytm returned an invalid response checksum.'
-        _set_gateway_connected('paytm',ok)
-        if ok:
-            detail = f'Paytm API authenticated. Code {code or "OK"}: {message or status or "NO_RECORD_FOUND"}'
-            return True, detail[:300]
-        return False, f'Paytm verification failed. Code {code or res.status_code}: {message or status or res.text[:180]}'[:300]
-    except Exception as e:
-        _set_gateway_connected('paytm',False)
-        return False,str(e)[:300]
+def _check_paytm_connection():
+    cfg = _zyvopay_config()
+    if not cfg['upi_id']:
+        _set_gateway_connected('paytm', False)
+        return False, 'Enter your UPI ID first.'
+    try:
+        _zyvopay_signing_key(cfg['api_key'])
+        # A harmless signed status lookup validates auth without creating a charge.
+        try:
+            _zyvopay_request('POST', 'check-payment.php', {'reference':'CONNECTION_TEST_' + secrets.token_hex(8)}, retries=0)
+            ok, detail = True, 'ZYVO PAY API token accepted.'
+        except RuntimeError as exc:
+            msg = str(exc)
+            # A not-found response is expected for a deliberately fake reference and proves auth.
+            ok = 'HTTP 404' in msg
+            detail = 'ZYVO PAY API token accepted.' if ok else msg
+        _set_gateway_connected('paytm', ok)
+        return ok, detail
+    except Exception as exc:
+        _set_gateway_connected('paytm', False)
+        return False, str(exc)[:260]
+
+def _zyvopay_qr_image(payment):
+    payment_uri = payment.get('payment_uri')
+    if not isinstance(payment_uri, str):
+        raise RuntimeError('ZYVO PAY returned an invalid payment URI.')
+    if not payment_uri:
+        image_url = payment.get('qr_image_url') or ''
+        if image_url:
+            parsed = urllib.parse.urlparse(str(image_url))
+            if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password:
+                raise RuntimeError('ZYVO PAY returned an unsafe provider QR image URL.')
+            return str(image_url)  # provider QR must remain unchanged
+        checkout = str(payment.get('checkout_url') or '')
+        parsed = urllib.parse.urlparse(checkout)
+        if parsed.scheme == 'https' and parsed.netloc and not parsed.username and not parsed.password:
+            return None, checkout
+        raise RuntimeError('ZYVO PAY did not return a usable QR image or checkout URL.')
+    style = payment.get('qr_style') or {}
+    config = style.get('config') if isinstance(style, dict) else None
+    if not isinstance(config, dict):
+        raise RuntimeError('ZYVO PAY did not return its required QR style configuration.')
+    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=12, border=4)
+    qr.add_data(payment_uri)  # exact URI returned by provider; never reconstruct or edit
+    qr.make(fit=True)
+    color = str(config.get('color') or '#000000')
+    gradient = config.get('gradient')
+    try:
+        dots = str(config.get('dots') or 'square').lower()
+        drawer = RoundedModuleDrawer() if ('round' in dots or dots == 'dot') else SquareModuleDrawer()
+        img = qr.make_image(image_factory=StyledPilImage, module_drawer=drawer, color_mask=SolidFillColorMask(front_color=color, back_color=(255,255,255))).convert('RGB')
+    except Exception:
+        img = qr.make_image(fill_color='black', back_color='white').convert('RGB')
+    # Keep the merchant response's style scoped to this payment; gradient is applied as a local visual gradient.
+    if isinstance(gradient, list) and len(gradient) >= 2:
+        try:
+            from PIL import ImageColor
+            c1, c2 = ImageColor.getrgb(str(gradient[0])), ImageColor.getrgb(str(gradient[1]))
+            pix = img.load(); w,h=img.size
+            for x in range(w):
+                t=x/max(1,w-1); col=tuple(int(c1[i]*(1-t)+c2[i]*t) for i in range(3))
+                for y in range(h):
+                    if pix[x,y] != (255,255,255): pix[x,y]=col
+        except Exception: pass
+    center_text = str(config.get('center_text') or '')[:4]
+    if center_text:
+        draw=ImageDraw.Draw(img); w,h=img.size; box=max(44,int(w*0.16)); x0=(w-box)//2; y0=(h-box)//2
+        draw.rectangle((x0-5,y0-5,x0+box+5,y0+box+5),fill='white')
+        draw.rounded_rectangle((x0,y0,x0+box,y0+box),radius=8,fill=color if color.startswith('#') else '#000000')
+        try:
+            font=ImageFont.truetype('DejaVuSans-Bold.ttf', max(10,int(box*0.25)))
+        except Exception: font=ImageFont.load_default()
+        draw.text((w//2,h//2),center_text,fill='white',anchor='mm',font=font)
+    out=io.BytesIO(); out.name='zyvopay_qr.png'; img.save(out,format='PNG'); out.seek(0)
+    return out
 
 def _create_paytm_dynamic_qr(amount):
-    """Create a real Paytm Dynamic QR order whose status can be auto-verified.
-
-    This replaces the old static UPI-only QR path. A static UPI URI has no
-    Paytm order record, so the Transaction Status API cannot safely verify it.
-    """
-    amount = float(amount)
-    cfg = _paytm_config()
-    if not cfg['mid'] or not cfg['merchant_key'] or not cfg['pos_id'] or not cfg['client_id']:
-        raise RuntimeError('Paytm requires MID, Merchant Key, Client ID and POS ID for Dynamic QR auto-verification.')
-    if not _PAYTM_CRYPTO_AVAILABLE:
-        raise RuntimeError('Paytm crypto dependency is missing. Add cryptography to requirements.txt and restart the bot.')
-
-    order_id = 'PTM' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + str(random.randint(1000,9999))
-    expiry = (datetime.datetime.now() + datetime.timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
-    body = {
-        'mid': cfg['mid'],
-        'orderId': order_id,
-        'amount': f'{amount:.2f}',
-        'businessType': 'UPI_QR_CODE',
-        'posId': cfg['pos_id'],
-        'orderDetails': BOT_BRAND_NAME,
-        'expiryDate': expiry,
-        'imageRequired': False,
-    }
-    body_text = _paytm_json_compact(body)
-    signature = _paytm_checksum_generate(body_text, cfg['merchant_key'])
-    payload = {
-        'body': body,
-        'head': {
-            'clientId': cfg['client_id'],
-            'version': 'v1',
-            'signature': signature,
-        },
-    }
-    res = HTTP_SESSION.post(
-        PAYTM_QR_CREATE_URL,
-        data=_paytm_json_compact(payload),
-        headers={'Content-Type':'application/json'},
-        timeout=15,
-    )
-    try:
-        data = res.json()
-    except Exception:
-        data = {}
-    raw_body = data.get('body') if isinstance(data, dict) else None
-    body_res = raw_body if isinstance(raw_body, dict) else {}
-    raw_result_info = body_res.get('resultInfo')
-    result_info = raw_result_info if isinstance(raw_result_info, dict) else {}
-    status = str((result_info or {}).get('resultStatus') or '')
-    message = str((result_info or {}).get('resultMsg') or '')
-    if res.status_code >= 400 or status.upper() != 'SUCCESS':
-        code = str((result_info or {}).get('resultCode') or res.status_code)
-        raise RuntimeError(f'Paytm QR creation failed ({code}): {message or res.text[:220]}')
-
-    qr_data = str(body_res.get('qrData') or '').strip()
-    qr_image = body_res.get('image')
-    if qr_data:
-        try:
-            return _build_stylish_qr_image(qr_data), order_id
-        except Exception:
-            pass
-    if qr_image:
-        try:
-            raw = __import__('base64').b64decode(str(qr_image))
-            image_file = io.BytesIO(raw)
-            image_file.name = 'paytm_qr.png'
-            image_file.seek(0)
-            return image_file, order_id
-        except Exception:
-            pass
-    raise RuntimeError('Paytm created the order but did not return usable QR data/image.')
+    amount = round(float(amount), 2)
+    if not 1 <= amount <= 100000:
+        raise RuntimeError('Payment amount must be between ₹1 and ₹1,00,000.')
+    cfg = _zyvopay_config()
+    if not cfg['connected']:
+        raise RuntimeError('ZYVO PAY is not connected. Save the UPI ID and API token, then check connection.')
+    order_id = 'RG' + datetime.datetime.now().strftime('%y%m%d%H%M%S') + secrets.token_hex(5).upper()
+    payload = {'order_id':order_id,'amount':amount,'customer_name':BOT_BRAND_NAME[:100], 'description':str(BOT_BRAND_NAME)[:120], 'expires_in':10}
+    payment = _zyvopay_request('POST', 'create-payment.php', payload)
+    returned_order = str(payment.get('order_id') or order_id)
+    reference = str(payment.get('reference') or '')
+    try: returned_amount = round(float(payment.get('amount')), 2)
+    except (TypeError, ValueError): returned_amount = -1
+    if not reference or returned_order != order_id or returned_amount != amount or str(payment.get('currency') or 'INR').upper() != 'INR':
+        raise RuntimeError('ZYVO PAY returned payment details that did not match the requested order and amount.')
+    qr = _zyvopay_qr_image(payment)
+    ZYVOPAY_ORDER_META[returned_order] = {'amount':amount,'gateway':'paytm','reference':reference,'currency':'INR','payment_uri':payment.get('payment_uri') or '', 'expires_at':payment.get('expires_at'), 'created_at':time.time()}
+    # QR-only provider image URL is returned unchanged; checkout URL is used if no image exists.
+    if isinstance(qr, tuple):
+        return qr[1], returned_order
+    return qr, returned_order
 
 def _verify_paytm_order(order_id):
-    cfg = _paytm_config()
-    if not cfg['mid'] or not cfg['merchant_key']:
-        return False,None,None
-    if not _PAYTM_CRYPTO_AVAILABLE:
-        return False,None,None
-    body = {'mid': cfg['mid'], 'orderId': str(order_id)}
+    cfg = _zyvopay_config()
+    details = ZYVOPAY_ORDER_META.get(str(order_id)) or ZYVOPAY_ORDER_META.get(order_id) or active_orders.get(str(order_id)) or active_orders.get(order_id) or {}
+    reference = str(details.get('reference') or '')
+    if not cfg['api_key'] or not reference:
+        return False, None, None
     try:
-        body_text = _paytm_json_compact(body)
-        signature = _paytm_checksum_generate(body_text, cfg['merchant_key'])
-        payload = {'body': body, 'head': {'signature': signature}}
-        res = HTTP_SESSION.post(
-            PAYTM_STATUS_URL,
-            data=_paytm_json_compact(payload),
-            headers={'Content-Type':'application/json'},
-            timeout=10,
-        )
-        data = res.json()
-        body_res = data.get('body') or {}
-        result_info = body_res.get('resultInfo') or {}
-        status = str(result_info.get('resultStatus') or '').upper()
-        if status != 'TXN_SUCCESS':
-            return False,None,None
-
-        response_signature = (data.get('head') or {}).get('signature')
-        if response_signature:
-            response_body_text = _paytm_json_compact(body_res)
-            if not _paytm_checksum_verify(response_body_text, cfg['merchant_key'], response_signature):
-                return False,None,None
-
-        txn_amount = body_res.get('txnAmount')
-        expected_details = active_orders.get(str(order_id)) or {}
-        expected_amount = expected_details.get('amount')
-        if txn_amount is not None and expected_amount is not None:
-            try:
-                if abs(float(txn_amount) - float(expected_amount)) > 0.01:
-                    return False,None,None
-            except (TypeError, ValueError):
-                return False,None,None
-        # Never credit/deliver a transaction whose amount does not exactly match
-        # the order amount.
-        utr = body_res.get('bankTxnId') or body_res.get('txnId') or 'N/A'
-        sender = body_res.get('gatewayName') or body_res.get('paymentMode') or 'Paytm/UPI'
-        return True, utr, sender
+        result = _zyvopay_request('POST', 'check-payment.php', {'reference':reference}, retries=1)
+        if str(result.get('status') or '').lower() != 'successful': return False, None, None
+        if str(result.get('reference') or '') != reference or str(result.get('order_id') or '') != str(order_id): return False, None, None
+        if str(result.get('currency') or '').upper() != 'INR': return False, None, None
+        try:
+            if round(float(result.get('amount')),2) != round(float(details.get('amount')),2): return False, None, None
+        except (TypeError, ValueError): return False, None, None
+        return True, str(result.get('utr') or 'N/A'), 'ZYVO PAY/UPI'
     except Exception:
-        return False,None,None
+        return False, None, None
 
-def _payment_poll_gap(gateway):
-    return PAYMENT_POLL_INTERVAL
+# ==================== FAMPAY BUTTON -> ZYVO PAY ====================
+# The FamPay gateway tile now runs on ZYVO PAY. The admin only pastes the full
+# public.secret API token; the merchant UPI is managed inside ZYVO PAY, so the
+# bot stores the marker 'ZYVOPAY' in the gateway UPI column. Gateways saved
+# before this update (real UPI ID + old FamGateway key) keep using the old
+# FamGateway code until the admin re-enters a token via the FamPay button.
+def _fam_uses_zyvopay():
+    row = _gateway_row('fam')
+    return bool(row and str(row[1] or '').strip().upper() == 'ZYVOPAY')
+
+def _zyvopay_ref_init():
+    with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS zyvopay_order_refs (order_id TEXT PRIMARY KEY, gateway TEXT NOT NULL, reference TEXT NOT NULL, amount REAL NOT NULL, created_at TEXT NOT NULL)")
+        conn.commit()
+
+def _zyvopay_ref_save(order_id, gateway, reference, amount):
+    try:
+        _zyvopay_ref_init()
+        with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
+            conn.execute("INSERT OR REPLACE INTO zyvopay_order_refs(order_id,gateway,reference,amount,created_at) VALUES(?,?,?,?,?)",
+                         (str(order_id), str(gateway), str(reference), float(amount), datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            conn.commit()
+    except Exception as exc:
+        print(f'[ZYVOPAY REF SAVE ERROR] {exc}')
+
+def _zyvopay_ref_get(order_id):
+    try:
+        _zyvopay_ref_init()
+        with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
+            row = conn.execute("SELECT reference,amount FROM zyvopay_order_refs WHERE order_id=?", (str(order_id),)).fetchone()
+        return (str(row[0]), float(row[1])) if row else (None, None)
+    except Exception:
+        return (None, None)
+
+def _check_fam_connection():
+    if not _fam_uses_zyvopay():
+        return _legacy_check_fam_connection()
+    cfg = _zyvopay_config('fam')
+    try:
+        _zyvopay_signing_key(cfg['api_key'])
+        try:
+            # Harmless signed lookup of a fake reference: proves auth without creating a charge.
+            _zyvopay_request('POST', 'check-payment.php', {'reference': 'CONNECTION_TEST_' + secrets.token_hex(8)}, retries=0, gateway='fam')
+            ok, detail = True, 'ZYVO PAY API token accepted.'
+        except RuntimeError as exc:
+            msg = str(exc)
+            ok = 'HTTP 404' in msg
+            detail = 'ZYVO PAY API token accepted.' if ok else msg
+        _set_gateway_connected('fam', ok)
+        return ok, detail
+    except Exception as exc:
+        _set_gateway_connected('fam', False)
+        return False, str(exc)[:260]
+
+def _create_fam_zyvopay_qr(amount):
+    amount = round(float(amount), 2)
+    if not 1 <= amount <= 100000:
+        raise RuntimeError('Payment amount must be between ₹1 and ₹1,00,000.')
+    cfg = _zyvopay_config('fam')
+    if not cfg['connected']:
+        raise RuntimeError('FamPay (ZYVO PAY) is not connected. Save the API token, then check connection.')
+    order_id = 'RG' + datetime.datetime.now().strftime('%y%m%d%H%M%S') + secrets.token_hex(5).upper()
+    payload = {'order_id': order_id, 'amount': amount, 'customer_name': BOT_BRAND_NAME[:100], 'description': str(BOT_BRAND_NAME)[:120], 'expires_in': 10}
+    payment = _zyvopay_request('POST', 'create-payment.php', payload, gateway='fam')
+    returned_order = str(payment.get('order_id') or order_id)
+    reference = str(payment.get('reference') or '')
+    try: returned_amount = round(float(payment.get('amount')), 2)
+    except (TypeError, ValueError): returned_amount = -1
+    if not reference or returned_order != order_id or returned_amount != amount or str(payment.get('currency') or 'INR').upper() != 'INR':
+        raise RuntimeError('ZYVO PAY returned payment details that did not match the requested order and amount.')
+    qr = _zyvopay_qr_image(payment)
+    ZYVOPAY_ORDER_META[returned_order] = {'amount': amount, 'gateway': 'fam', 'reference': reference, 'currency': 'INR', 'payment_uri': payment.get('payment_uri') or '', 'expires_at': payment.get('expires_at'), 'created_at': time.time()}
+    _zyvopay_ref_save(returned_order, 'fam', reference, amount)  # survives a bot restart
+    if isinstance(qr, tuple):
+        return qr[1], returned_order
+    return qr, returned_order
+
+def _verify_fam_zyvopay_order(order_id):
+    cfg = _zyvopay_config('fam')
+    meta = ZYVOPAY_ORDER_META.get(str(order_id)) or {}
+    reference = str(meta.get('reference') or '')
+    expected = meta.get('amount')
+    if not reference:
+        reference, expected = _zyvopay_ref_get(order_id)
+    if not cfg['api_key'] or not reference or expected is None:
+        return False, None, None
+    try:
+        result = _zyvopay_request('POST', 'check-payment.php', {'reference': reference}, retries=1, gateway='fam')
+        if str(result.get('status') or '').lower() != 'successful': return False, None, None
+        if str(result.get('reference') or '') != reference or str(result.get('order_id') or '') != str(order_id): return False, None, None
+        if str(result.get('currency') or '').upper() != 'INR': return False, None, None
+        try:
+            if round(float(result.get('amount')), 2) != round(float(expected), 2): return False, None, None
+        except (TypeError, ValueError): return False, None, None
+        return True, str(result.get('utr') or 'N/A'), 'ZYVO PAY/UPI'
+    except Exception:
+        return False, None, None
+
+def create_fam_qr(amount):
+    if _fam_uses_zyvopay():
+        return _create_fam_zyvopay_qr(amount)
+    return _legacy_create_fam_qr(amount)
+
+def verify_fam_order(order_id):
+    if _fam_uses_zyvopay():
+        return _verify_fam_zyvopay_order(order_id)
+    return _legacy_verify_fam_order(order_id)
 
 def _check_gateway_connection(gateway):
     g=str(gateway).lower()
-    if g=='fam': return _check_fam_connection()
-    if g=='paytm': return _check_paytm_connection()
-    return (False,'Unknown payment gateway.')
+    return _check_fam_connection() if g=='fam' else _check_paytm_connection() if g=='paytm' else (False,'Unknown payment gateway.')
 
 def _create_active_gateway_qr(amount):
     gw=_get_active_payment_gateway()
     if gw=='fam': return create_fam_qr(amount)
-    if gw=='paytm': return _create_paytm_dynamic_qr(amount)
-    raise RuntimeError('No payment gateway is ON. Open Admin Panel > FamPay Gateway, check the connection and turn it ON.')
+    if gw=='paytm':
+        cfg=_paytm_config(); ready=_paytm_payment_config_error()
+        if not cfg['connected']: raise RuntimeError('PayTM is not connected. Check PayTM Connection first.')
+        if ready: raise RuntimeError('PayTM payment setup is incomplete: '+ready)
+        return _create_paytm_dynamic_qr(amount)
+    raise RuntimeError('No connected payment gateway is active.')
 
 def _verify_active_gateway_order(order_id,gateway=None):
     details=active_orders.get(str(order_id)) or active_orders.get(order_id) or {}
@@ -2323,7 +2356,7 @@ def _get_hack_server_status(product_name):
     if not cfg: return None
     return {'api_key':cfg[1],'server_url':cfg[2],'product_id':cfg[3],'updated_at':cfg[4]}
 
-def _legacy_resolve_api_route(product_name, plan_id=None, local_pid_id=None, duration=None):
+def _resolve_api_route(product_name, plan_id=None, local_pid_id=None, duration=None):
     new_cfg=_new_server_config(product_name) if product_name else None
     if new_cfg and new_cfg[1] and new_cfg[2] and new_cfg[3]:
         new_valid_id=_new_server_plan_valid_id(product_name,plan_id) if plan_id is not None else ''
@@ -3819,9 +3852,7 @@ def _safe_format_custom_text(template, **values):
 
     def repl(match):
         key = match.group(1)
-        lookup = aliases.get(key)
-        if not isinstance(lookup, str):
-            lookup = key
+        lookup = aliases.get(key, key)
         return str(values.get(lookup, match.group(0)))
 
     return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, template)
@@ -4156,10 +4187,10 @@ def show_product_button_color_detail(chat_id, product_name, message_id=None):
         pid,_,days,reg,res=plan[:5]
         key=f"price:{product_name}:{pid}"; h=_ui_hash(key); catalog[h]=key
         current=_button_color_name(key)
-        icon={"red":"🔴","blue":"🔵","green":"🟢"}.get(current or "", "⚪")
+        icon={"red":"🔴","blue":"🔵","green":"🟢"}.get(current,"⚪")
         markup.add(types.InlineKeyboardButton(f"{icon} {days} · ₹{reg:.0f} / ₹{res:.0f}",callback_data=f"upc_plan_select_{h}"))
     product_key=f"hack:{product_name}"; product_color=_button_color_name(product_key)
-    product_icon={"red":"🔴","blue":"🔵","green":"🟢"}.get(product_color or "", "⚪")
+    product_icon={"red":"🔴","blue":"🔵","green":"🟢"}.get(product_color,"⚪")
     markup.add(types.InlineKeyboardButton(f"🎨 Product Color {product_icon}",callback_data=f"upc_product_color_{_ui_hash(product_key)}"))
     markup.add(types.InlineKeyboardButton("⬅️ Back to All Buttons",callback_data="upc_back_catalog"))
     admin_temp_data.setdefault(chat_id,{})["product_plan_color_catalog"]=catalog
@@ -4212,7 +4243,7 @@ def show_user_panel_button_color_catalog(chat_id, message_id=None):
             "red": "🔴",
             "blue": "🔵",
             "green": "🟢",
-        }.get(current or "", "⚪")
+        }.get(current, "⚪")
 
         palette = ("blue", "green", "blue", "green", "red")
         button = _admin_colorful_button(
@@ -4414,6 +4445,155 @@ def reset_user_completely_db(user_id):
     conn.close()
     return success
 
+
+# Bulk user reset snapshot. This is stored beside the live DB and contains a
+# full SQLite snapshot, but restore copies back only user-owned tables so that
+# products, plans, country catalogs, API/server configuration and bot settings
+# remain untouched.
+USER_RESET_BACKUP_PATH = BOT_DB_PATH.with_name(BOT_DB_PATH.stem + ".users_reset_backup.db")
+_USER_RESET_TABLES = (
+    "users", "order_history", "pending_payments", "processed_payments",
+    "reseller_api_credentials", "reseller_api_idempotency",
+    "bot_make_orders", "custom_plan_prices",
+)
+
+def _user_reset_admin_ids():
+    ids = set()
+    for value in list(globals().get("ADMIN_IDS", []) or []) + list(globals().get("_HARDCODED_ROOT_ADMIN_IDS", []) or []):
+        try:
+            ids.add(int(value))
+        except Exception:
+            pass
+    return ids
+
+def _create_user_reset_snapshot():
+    if USER_RESET_BACKUP_PATH.exists():
+        raise RuntimeError("A user-reset backup already exists. Restore it before starting another bulk reset.")
+    USER_RESET_BACKUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(str(BOT_DB_PATH), timeout=30)
+    target = sqlite3.connect(str(USER_RESET_BACKUP_PATH), timeout=30)
+    try:
+        source.backup(target)
+        target.commit()
+    except Exception:
+        target.close()
+        source.close()
+        try:
+            USER_RESET_BACKUP_PATH.unlink()
+        except Exception:
+            pass
+        raise
+    finally:
+        try: target.close()
+        except Exception: pass
+        try: source.close()
+        except Exception: pass
+
+def reset_all_users_and_resellers_db():
+    # Create a recoverable snapshot before changing anything.
+    _create_user_reset_snapshot()
+    admin_ids = _user_reset_admin_ids()
+    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=30)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in admin_ids)
+        if admin_ids:
+            cur.execute(f"DELETE FROM users WHERE user_id NOT IN ({placeholders})", tuple(sorted(admin_ids)))
+        else:
+            cur.execute("DELETE FROM users")
+        for table in _USER_RESET_TABLES:
+            if table == "users":
+                continue
+            exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if exists:
+                cur.execute(f'DELETE FROM "{table}"')
+        # Preserve coupon definitions/codes but clear their per-user usage.
+        if cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coupons'").fetchone():
+            cols = {r[1] for r in cur.execute('PRAGMA table_info(coupons)').fetchall()}
+            updates = []
+            if "used_by" in cols: updates.append("used_by=0")
+            if "used_at" in cols: updates.append("used_at=''")
+            if updates: cur.execute("UPDATE coupons SET " + ", ".join(updates))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        try: USER_RESET_BACKUP_PATH.unlink()
+        except Exception: pass
+        raise
+    finally:
+        conn.close()
+
+def restore_all_users_and_resellers_db():
+    if not USER_RESET_BACKUP_PATH.is_file():
+        raise FileNotFoundError("No saved user-reset backup is available.")
+    live = sqlite3.connect(str(BOT_DB_PATH), timeout=30)
+    snap = sqlite3.connect(str(USER_RESET_BACKUP_PATH), timeout=30)
+    admin_ids = _user_reset_admin_ids()
+    try:
+        live.execute("PRAGMA foreign_keys=OFF")
+        live.execute("BEGIN IMMEDIATE")
+        cur = live.cursor()
+        # Restore ordinary users/resellers from the snapshot while preserving
+        # current admin accounts and the existing product/configuration tables.
+        if admin_ids:
+            marks = ",".join("?" for _ in admin_ids)
+            cur.execute(f"DELETE FROM users WHERE user_id NOT IN ({marks})", tuple(sorted(admin_ids)))
+        else:
+            cur.execute("DELETE FROM users")
+        snap_users = snap.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        if snap_users:
+            snap_cols = [r[1] for r in snap.execute('PRAGMA table_info(users)').fetchall()]
+            live_cols = {r[1] for r in cur.execute('PRAGMA table_info(users)').fetchall()}
+            common = [col for col in snap_cols if col in live_cols]
+            if common:
+                names = ",".join('"' + col.replace('"','""') + '"' for col in common)
+                rows = snap.execute(f'SELECT {names} FROM users').fetchall()
+                for row in rows:
+                    if admin_ids and int(row[0] or 0) in admin_ids:
+                        continue
+                    cur.execute(f'INSERT OR REPLACE INTO users ({names}) VALUES ({",".join("?" for _ in common)})', row)
+        for table in _USER_RESET_TABLES:
+            if table == "users":
+                continue
+            has_snap = snap.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            has_live = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if not (has_snap and has_live):
+                continue
+            cur.execute(f'DELETE FROM "{table}"')
+            snap_cols = [r[1] for r in snap.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            live_cols = {r[1] for r in cur.execute(f'PRAGMA table_info("{table}")').fetchall()}
+            common = [col for col in snap_cols if col in live_cols]
+            if common:
+                names = ",".join('"' + col.replace('"','""') + '"' for col in common)
+                rows = snap.execute(f'SELECT {names} FROM "{table}"').fetchall()
+                cur.executemany(f'INSERT OR REPLACE INTO "{table}" ({names}) VALUES ({",".join("?" for _ in common)})', rows)
+        # Restore prior coupon usage only; keep any coupon definitions created since reset.
+        has_coupons = snap.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coupons'").fetchone()
+        if has_coupons and cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coupons'").fetchone():
+            snap_cols = {r[1] for r in snap.execute('PRAGMA table_info(coupons)').fetchall()}
+            live_cols = {r[1] for r in cur.execute('PRAGMA table_info(coupons)').fetchall()}
+            if "code" in snap_cols and "code" in live_cols:
+                usage = [x for x in ("used_by", "used_at") if x in snap_cols and x in live_cols]
+                if usage:
+                    fields = ",".join('"' + x + '"' for x in usage)
+                    for row in snap.execute(f'SELECT code,{fields} FROM coupons').fetchall():
+                        cur.execute(f'UPDATE coupons SET {",".join(chr(34)+x+chr(34)+"=?" for x in usage)} WHERE code=?', tuple(row[1:]) + (row[0],))
+        live.commit()
+    except Exception:
+        live.rollback()
+        raise
+    finally:
+        live.close()
+        snap.close()
+    try:
+        USER_RESET_BACKUP_PATH.unlink()
+    except Exception:
+        pass
+    return True
+
 def set_reseller_status(user_id, status=1):
     conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
     cursor = conn.cursor()
@@ -4511,8 +4691,6 @@ def update_product_name_db(old_name, new_name):
     try:
         conn.execute('UPDATE products SET name=? WHERE name=?', (new_name, old_name))
         conn.execute('UPDATE panels SET panel_name=? WHERE panel_name=?', (new_name, old_name))
-        conn.execute('UPDATE licence_product_reset_settings SET product_name=? WHERE product_name=?', (new_name, old_name))
-        conn.execute('UPDATE licence_product_map SET local_product_name=? WHERE local_product_name=?', (new_name, old_name))
         conn.commit()
     finally:
         conn.close()
@@ -4645,11 +4823,6 @@ def add_keys_db_bulk(panel_name, days_plan, raw_keys):
 def delete_entire_hack_db(name):
     conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
     cursor = conn.cursor()
-    plan_ids = [row[0] for row in cursor.execute('SELECT id FROM products WHERE name=?', (name,)).fetchall()]
-    if plan_ids:
-        cursor.executemany('DELETE FROM licence_plan_map WHERE local_plan_id=?', [(pid,) for pid in plan_ids])
-    cursor.execute('DELETE FROM licence_product_reset_settings WHERE product_name=?', (name,))
-    cursor.execute('DELETE FROM licence_product_map WHERE local_product_name=?', (name,))
     cursor.execute('DELETE FROM products WHERE name = ?', (name,))
     conn.commit()
     conn.close()
@@ -4657,12 +4830,7 @@ def delete_entire_hack_db(name):
 def delete_product_plan_db(plan_id):
     conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
     cursor = conn.cursor()
-    product = cursor.execute('SELECT name FROM products WHERE id=?', (plan_id,)).fetchone()
-    cursor.execute('DELETE FROM licence_plan_map WHERE local_plan_id=?', (plan_id,))
     cursor.execute('DELETE FROM products WHERE id = ?', (plan_id,))
-    if product and not cursor.execute('SELECT 1 FROM products WHERE name=? LIMIT 1', (product[0],)).fetchone():
-        cursor.execute('DELETE FROM licence_product_reset_settings WHERE product_name=?', (product[0],))
-        cursor.execute('DELETE FROM licence_product_map WHERE local_product_name=?', (product[0],))
     conn.commit()
     conn.close()
 
@@ -4979,7 +5147,7 @@ def _tobix_generate_key(duration, purchase_ref=None, note=''):
     purchase_ref = purchase_ref or f'RG-{time.time_ns()}-{random.randint(100000,999999)}'
     idem = hashlib.sha256(f'tobix|{purchase_ref}'.encode()).hexdigest()[:48]
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json', 'Content-Type': 'application/json', 'Idempotency-Key': idem, 'User-Agent': 'RG-Cheat-Shop-Bot/TobiX'}
-    payload: dict[str, str | int] = {'days': days}
+    payload = {'days': days}
     if note:
         payload['note'] = str(note)[:200]
     try:
@@ -4991,10 +5159,7 @@ def _tobix_generate_key(duration, purchase_ref=None, note=''):
             data = {}
         print(f'[TobiX] create-key status={response.status_code} days={days} response={raw[:1500]}')
         if response.status_code in (200, 201, 202, 409) and isinstance(data, dict) and data.get('success') is not False:
-            raw_key = data.get('key')
-            obj = raw_key if isinstance(raw_key, dict) else data
-            if not isinstance(obj, dict):
-                return None
+            obj = data.get('key') if isinstance(data.get('key'), dict) else data
             key = obj.get('license_key') or obj.get('licenseKey') or obj.get('key')
             if key:
                 return str(key).strip()
@@ -5087,446 +5252,6 @@ def step_save_tobix_url(message):
         f"{'🟢 Connected Successfully!' if ok else '🔴 Not Connected'}\nℹ️ {html.escape(str(detail))}",
         parse_mode='HTML', reply_markup=_tobix_api_markup())
 
-# ==================== BANTI API SYSTEM ====================
-# Form-POST reseller API (reseller_v1.php) with api_key + x-master-key header.
-# Priority: when a hack is enabled for Banti, Banti is used FIRST for that hack
-# and every other server (9X / TobiX / New Server / Old Server) is simply held.
-# Disabling Banti for the hack instantly returns delivery to the previous server.
-BANTI_API_URL_KEY = 'banti_api_url'
-BANTI_API_TOKEN_KEY = 'banti_api_token'
-BANTI_MASTER_KEY_KEY = 'banti_master_key'
-BANTI_NAME_KEY = 'banti_display_name'
-BANTI_PRODUCT_MAP_KEY = 'banti_product_map'   # {hack name: enabled}
-BANTI_PID_MAP_KEY = 'banti_pid_map'           # {hack name: Banti Product PID}
-BANTI_VALID_MAP_KEY = 'banti_valid_map'       # {plan id: Banti duration name}
-BANTI_DEFAULT_URL = 'https://bantibhaiya.to/api/reseller_v1.php'
-BANTI_DEFAULT_MASTER_KEY = os.getenv('BANTI_MASTER_KEY', 'a7f3e8b2c9d1f4a6b8c2d5e9f1a3b6c8').strip()
-BANTI_BROWSER_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-
-
-def _banti_json_get(key):
-    try:
-        data = json.loads(get_setting(key) or '{}')
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _banti_json_set(key, data):
-    set_setting(key, json.dumps(data, ensure_ascii=False, separators=(',', ':')))
-
-
-def _banti_name():
-    return (str(get_setting(BANTI_NAME_KEY) or '').strip() or 'Banti API System')[:40]
-
-
-def _banti_base_url(value=None):
-    raw = value if value is not None else (get_setting(BANTI_API_URL_KEY) or BANTI_DEFAULT_URL)
-    url = str(raw).strip().strip('`').strip()
-    if value is not None and url and not re.match(r'^https?://', url, re.I) and re.match(r'^[\w.-]+\.[a-z]{2,}(/.*)?$', url, re.I):
-        url = 'https://' + url
-    if not re.match(r'^https?://', url, re.I):
-        return ''
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.netloc:
-        return ''
-    path = parsed.path.rstrip('/')
-    if not path:
-        path = '/api/reseller_v1.php'
-    elif path.lower().endswith('/api'):
-        path += '/reseller_v1.php'
-    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, '', '', ''))
-
-
-def _banti_api_token():
-    return str(get_setting(BANTI_API_TOKEN_KEY) or '').strip()
-
-
-def _banti_master_key():
-    return str(get_setting(BANTI_MASTER_KEY_KEY) or BANTI_DEFAULT_MASTER_KEY or '').strip()
-
-
-def _banti_connected():
-    return str(get_setting('banti_api_connected') or '0') == '1'
-
-
-def _banti_product_enabled(product_name):
-    return bool(_banti_json_get(BANTI_PRODUCT_MAP_KEY).get(str(product_name), False))
-
-
-def _set_banti_product_enabled(product_name, enabled):
-    data = _banti_json_get(BANTI_PRODUCT_MAP_KEY)
-    data[str(product_name)] = bool(enabled)
-    _banti_json_set(BANTI_PRODUCT_MAP_KEY, data)
-
-
-def _banti_product_id(product_name):
-    return str(_banti_json_get(BANTI_PID_MAP_KEY).get(str(product_name), '') or '').strip()
-
-
-def _set_banti_product_id(product_name, pid):
-    data = _banti_json_get(BANTI_PID_MAP_KEY)
-    data[str(product_name)] = str(pid).strip()
-    _banti_json_set(BANTI_PID_MAP_KEY, data)
-
-
-def _banti_valid_id(plan_id):
-    """Banti duration name saved for this plan (e.g. '1 Day'); '' if not set."""
-    if plan_id is None:
-        return ''
-    return str(_banti_json_get(BANTI_VALID_MAP_KEY).get(str(plan_id), '') or '').strip()
-
-
-def _set_banti_valid_id(plan_id, valid_id):
-    data = _banti_json_get(BANTI_VALID_MAP_KEY)
-    data[str(plan_id)] = str(valid_id).strip()
-    _banti_json_set(BANTI_VALID_MAP_KEY, data)
-
-
-def _banti_product_by_hash(value):
-    for name in get_unique_products():
-        if _ui_hash(name) == str(value):
-            return name
-    return None
-
-
-def _banti_headers():
-    return {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'x-master-key': _banti_master_key(),
-        'User-Agent': BANTI_BROWSER_UA,
-    }
-
-
-def _banti_failure_text(data):
-    """Return an error text when a JSON reply clearly says the call failed, else ''."""
-    if not isinstance(data, dict):
-        return ''
-    status = str(data.get('status', '')).strip().lower()
-    failed = (data.get('success') is False or data.get('ok') is False
-              or status in {'error', 'fail', 'failed', 'false', '0'}
-              or bool(data.get('error')))
-    if not failed:
-        return ''
-    msg = data.get('message') or data.get('msg') or data.get('error') or data.get('detail') or 'Request failed'
-    return str(msg)[:300]
-
-
-def _banti_check_connection():
-    token, base = _banti_api_token(), _banti_base_url()
-    if not token:
-        set_setting('banti_api_connected', '0')
-        return False, 'API Token is not configured.', None
-    if not base:
-        set_setting('banti_api_connected', '0')
-        return False, 'Invalid Server Link.', None
-    try:
-        response = HTTP_SESSION.post(
-            base, data={'api_key': token, 'action': 'balance'},
-            headers=_banti_headers(), timeout=20, allow_redirects=True)
-        raw = response.text.strip()
-        data = _api_server_parse_json(response)
-        if response.status_code != 200:
-            set_setting('banti_api_connected', '0')
-            return False, f'HTTP {response.status_code}: {raw[:250]}', data
-        if not data:
-            set_setting('banti_api_connected', '0')
-            return False, f'Unexpected reply from server: {raw[:250] or "empty"}', data
-        err = _banti_failure_text(data)
-        if err:
-            low = err.lower()
-            auth_problem = any(w in low for w in ('api key', 'apikey', 'api_key', 'token', 'unauthor',
-                                                  'forbidden', 'master', 'invalid key', 'denied', 'suspend', 'block'))
-            if not auth_problem and 'action' in low:
-                # Server reachable and the key was not rejected; this server simply
-                # does not implement the optional balance action.
-                set_setting('banti_api_connected', '1')
-                return True, 'Server reachable, API key accepted.', data
-            set_setting('banti_api_connected', '0')
-            return False, err, data
-        set_setting('banti_api_connected', '1')
-        balance = data.get('balance')
-        if balance is None and isinstance(data.get('data'), dict):
-            balance = data['data'].get('balance')
-        return True, (f'Balance: {balance}' if balance is not None else 'Authentication successful.'), data
-    except Exception as exc:
-        set_setting('banti_api_connected', '0')
-        return False, str(exc)[:300], None
-
-
-def _banti_source_ready_for_plan(product_name, plan_id=None, duration=None):
-    if not product_name or _product_hidden(product_name):
-        return False
-    if not _banti_api_token() or not _banti_base_url() or not _banti_connected():
-        return False
-    if not _banti_product_enabled(product_name) or not _banti_product_id(product_name):
-        return False
-    if plan_id is not None and _plan_hidden(plan_id):
-        return False
-    return True
-
-
-def _banti_generate_key(product_name, plan_id, duration, android_id=None, purchase_ref=None):
-    token, base = _banti_api_token(), _banti_base_url()
-    pid = _banti_product_id(product_name)
-    dur_name = _banti_valid_id(plan_id) or str(duration or '').strip()
-    if not token or not base or not pid or not dur_name:
-        print(f'[BANTI] invalid configuration: url={bool(base)} token={bool(token)} pid={bool(pid)} duration={dur_name!r}')
-        return None
-    payload = {'api_key': token, 'action': 'buy', 'product_id': pid, 'duration': dur_name, 'quantity': 1}
-    if android_id:
-        payload['android_id'] = str(android_id).strip()
-    try:
-        # Exactly ONE purchase attempt. A timeout after POST is ambiguous (the
-        # provider may already have charged), so it is never retried.
-        response = HTTP_SESSION.post(base, data=payload, headers=_banti_headers(), timeout=30, allow_redirects=True)
-        raw = response.text.strip()
-        print(f'[BANTI] buy ref={purchase_ref} product={product_name} pid={pid} duration={dur_name} '
-              f'status={response.status_code} response={raw[:1500]}')
-        data = _api_server_parse_json(response)
-        if response.status_code not in (200, 201, 202):
-            return None
-        err = _banti_failure_text(data)
-        if err:
-            print(f'[BANTI] provider rejected purchase: {err}')
-            return None
-        key_value = _extract_api_key_value(data) if data else None
-        if key_value:
-            if isinstance(key_value, (list, tuple)):
-                key_value = key_value[0] if key_value else None
-            if key_value:
-                return str(key_value).strip()
-        if raw and not raw.startswith(('{', '[', '<')) and len(raw) < 120:
-            return raw
-    except Exception as exc:
-        print(f'[BANTI] buy exception: {str(exc)[:500]}')
-    return None
-
-
-def _banti_panel_text():
-    token = _banti_api_token()
-    raw_url = str(get_setting(BANTI_API_URL_KEY) or '').strip()
-    url = _banti_base_url() if raw_url else ''
-    status = '🟢 Connected Successfully' if _banti_connected() else '🔴 Not Connected'
-    token_line = f'<code>{html.escape(token[:6])}••••••</code>' if token else '<i>Not Set</i>'
-    url_line = f'<code>{html.escape(url)}</code>' if url else '<i>Not Set</i>'
-    enabled = [n for n in get_unique_products() if _banti_product_enabled(n)]
-    hacks_line = html.escape(', '.join(enabled)) if enabled else '<i>None</i>'
-    return (f'🟣 <b>{html.escape(_banti_name()).upper()}</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
-            f'📡 <b>Status:</b> {status}\n🌐 <b>Server:</b> {url_line}\n🔑 <b>API Token:</b> {token_line}\n'
-            f'🎮 <b>Active Hacks:</b> {hacks_line}\n\n'
-            '<i>Enable a hack in Connect Hack to deliver it through Banti. '
-            'Disable it to go back to its previous server.</i>')
-
-
-def _banti_api_markup():
-    m = types.InlineKeyboardMarkup(row_width=2)
-    m.row(_admin_colorful_button('🔑 API Token', callback_data='banti_set_token', color='green'),
-          _admin_colorful_button('🔍 Check Connection', callback_data='banti_check', color='green'))
-    m.row(_admin_colorful_button('✏️ Edit Token', callback_data='banti_edit_token', color='blue'),
-          _admin_colorful_button('🌐 Edit Link', callback_data='banti_edit_url', color='blue'))
-    m.row(_admin_colorful_button('✏️ Edit Name', callback_data='banti_edit_name', color='blue'),
-          _admin_colorful_button('🔐 Master Key', callback_data='banti_edit_master', color='blue'))
-    m.add(_admin_colorful_button('🎮 Connect Hack', callback_data='banti_products', color='green'))
-    m.add(_admin_colorful_button('🔙 API & Servers', callback_data='admin_api_system', color='red'))
-    return _style_admin_markup(_ensure_admin_back_button(m))
-
-
-def _send_banti_panel(call):
-    _admin_ui_send(call, _banti_panel_text(), parse_mode='HTML', reply_markup=_banti_api_markup())
-
-
-def _banti_send_panel_message(chat_id):
-    bot.send_message(chat_id, _banti_panel_text(), parse_mode='HTML', reply_markup=_banti_api_markup())
-
-
-def _banti_products_markup():
-    m = types.InlineKeyboardMarkup(row_width=2)
-    for name in get_unique_products():
-        on = _banti_product_enabled(name)
-        m.add(_admin_colorful_button(f"{'🟢' if on else '⚪'} {name}",
-                                     callback_data=f'banti_hack_{_ui_hash(name)}',
-                                     color='green' if on else 'blue'))
-    m.add(_admin_colorful_button('🔙 Banti API System', callback_data='banti_api_system', color='red'))
-    return _style_admin_markup(_ensure_admin_back_button(m))
-
-
-def _banti_hack_view(product_name):
-    on = _banti_product_enabled(product_name)
-    pid = _banti_product_id(product_name)
-    lines = [f'🎮 <b>{html.escape(product_name)}</b>', '',
-             f"🟣 <b>Banti:</b> {'🟢 ENABLED (this hack is delivered by Banti)' if on else '⚪ DISABLED (previous server in use)'}",
-             f"🆔 <b>Product ID:</b> <code>{html.escape(pid) if pid else 'Not Set'}</code>", '',
-             '<b>Plans</b> (Valid ID = exact Banti duration name):']
-    m = types.InlineKeyboardMarkup(row_width=1)
-    m.add(_admin_colorful_button('🔴 Disable Banti' if on else '🟢 Enable Banti',
-                                 callback_data=f'banti_toggle_{_ui_hash(product_name)}',
-                                 color='red' if on else 'green'))
-    m.add(_admin_colorful_button('🆔 Set / Change Product ID',
-                                 callback_data=f'banti_pid_{_ui_hash(product_name)}', color='blue'))
-    for row in get_product_plans(product_name):
-        plan_id, days = int(row[0]), str(row[2])
-        vid = _banti_valid_id(plan_id)
-        lines.append(f"• {html.escape(days)} → <code>{html.escape(vid) if vid else html.escape(days) + ' (auto)'}</code>")
-        m.add(_admin_colorful_button(f"{'🟢' if vid else '⚪'} {days} | VID: {vid or 'auto'}"[:60],
-                                     callback_data=f'banti_plan_{_ui_hash(product_name)}_{plan_id}',
-                                     color='green' if vid else 'blue'))
-    m.add(_admin_colorful_button('🔙 Hack List', callback_data='banti_products', color='red'))
-    return '\n'.join(lines), _style_admin_markup(_ensure_admin_back_button(m))
-
-
-def _banti_step_guard(message, retry_handler=None):
-    """Common checks for Banti text steps. Returns the cleaned text, or None to stop."""
-    uid = int(message.from_user.id)
-    if not _is_admin(uid):
-        return None
-    text = (message.text or '').strip()
-    if _is_command_input(text):
-        _cancel_pending_id_step(uid)
-        admin_temp_data.pop(uid, None)
-        if text.lower().split()[0] == '/start':
-            send_welcome(message)
-        else:
-            bot.send_message(message.chat.id, 'ℹ️ Entry cancelled. Open Banti API System again.')
-        return None
-    if not text:
-        if retry_handler:
-            m = bot.send_message(message.chat.id, '❌ Value cannot be empty. Enter it again.')
-            bot.register_next_step_handler(m, retry_handler)
-        return None
-    return text
-
-
-def _banti_delete_secret(message):
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-
-
-def _banti_report_connection(chat_id):
-    ok, detail, _ = _banti_check_connection()
-    bot.send_message(chat_id,
-                     f"{'🟢 <b>Connected Successfully!</b>' if ok else '🔴 <b>Not Connected</b>'}\nℹ️ {html.escape(str(detail))}",
-                     parse_mode='HTML')
-    _banti_send_panel_message(chat_id)   # automatically steps back to the panel
-
-
-# --- setup flow: API Token -> Server Link -> auto check -> back to panel ---
-def step_save_banti_token(message):
-    text = _banti_step_guard(message, step_save_banti_token)
-    if text is None:
-        return
-    _banti_delete_secret(message)
-    admin_temp_data.setdefault(int(message.from_user.id), {})['banti_api_token'] = text
-    m = bot.send_message(message.chat.id,
-                         '🌐 <b>Enter Banti Server Link:</b>\n\nExample: <code>https://bantibhaiya.to/api/reseller_v1.php</code>',
-                         parse_mode='HTML')
-    bot.register_next_step_handler(m, step_save_banti_url)
-
-
-def step_save_banti_url(message):
-    text = _banti_step_guard(message, step_save_banti_url)
-    if text is None:
-        return
-    uid = int(message.from_user.id)
-    token = str(admin_temp_data.get(uid, {}).get('banti_api_token') or _banti_api_token()).strip()
-    url = _banti_base_url(text)
-    if not token:
-        m = bot.send_message(message.chat.id, '❌ API Token is missing. Enter the API Token first.')
-        bot.register_next_step_handler(m, step_save_banti_token)
-        return
-    if not url:
-        m = bot.send_message(message.chat.id, '❌ Invalid Server Link. Send a valid http:// or https:// link.')
-        bot.register_next_step_handler(m, step_save_banti_url)
-        return
-    set_setting(BANTI_API_TOKEN_KEY, token)
-    set_setting(BANTI_API_URL_KEY, url)
-    set_setting('banti_api_connected', '0')
-    admin_temp_data.pop(uid, None)
-    bot.send_message(message.chat.id, f'💾 <b>Saved.</b>\n🌐 <code>{html.escape(url)}</code>\n⏳ Checking connection…', parse_mode='HTML')
-    _banti_report_connection(message.chat.id)
-
-
-# --- single-field edits ---
-def step_edit_banti_token(message):
-    text = _banti_step_guard(message, step_edit_banti_token)
-    if text is None:
-        return
-    _banti_delete_secret(message)
-    set_setting(BANTI_API_TOKEN_KEY, text)
-    set_setting('banti_api_connected', '0')
-    _banti_report_connection(message.chat.id)
-
-
-def step_edit_banti_url(message):
-    text = _banti_step_guard(message, step_edit_banti_url)
-    if text is None:
-        return
-    url = _banti_base_url(text)
-    if not url:
-        m = bot.send_message(message.chat.id, '❌ Invalid Server Link. Send a valid http:// or https:// link.')
-        bot.register_next_step_handler(m, step_edit_banti_url)
-        return
-    set_setting(BANTI_API_URL_KEY, url)
-    set_setting('banti_api_connected', '0')
-    _banti_report_connection(message.chat.id)
-
-
-def step_edit_banti_name(message):
-    text = _banti_step_guard(message, step_edit_banti_name)
-    if text is None:
-        return
-    set_setting(BANTI_NAME_KEY, text[:40])
-    bot.send_message(message.chat.id, f'✅ Name saved: <b>{html.escape(text[:40])}</b>', parse_mode='HTML')
-    _banti_send_panel_message(message.chat.id)
-
-
-def step_edit_banti_master(message):
-    text = _banti_step_guard(message, step_edit_banti_master)
-    if text is None:
-        return
-    _banti_delete_secret(message)
-    set_setting(BANTI_MASTER_KEY_KEY, text)
-    set_setting('banti_api_connected', '0')
-    _banti_report_connection(message.chat.id)
-
-
-# --- per-hack Product ID / per-plan Valid ID ---
-def step_save_banti_product_id(message):
-    text = _banti_step_guard(message, step_save_banti_product_id)
-    if text is None:
-        return
-    uid = int(message.from_user.id)
-    product_name = admin_temp_data.get(uid, {}).get('banti_product')
-    if not product_name:
-        bot.send_message(message.chat.id, '❌ Session expired. Open Connect Hack again.')
-        return
-    _set_banti_product_id(product_name, text)
-    admin_temp_data.pop(uid, None)
-    bot.send_message(message.chat.id, f'✅ <b>Product ID saved:</b> <code>{html.escape(text)}</code>', parse_mode='HTML')
-    view, markup = _banti_hack_view(product_name)
-    bot.send_message(message.chat.id, view, parse_mode='HTML', reply_markup=markup)
-
-
-def step_save_banti_valid_id(message):
-    text = _banti_step_guard(message, step_save_banti_valid_id)
-    if text is None:
-        return
-    uid = int(message.from_user.id)
-    d = admin_temp_data.get(uid, {})
-    product_name, plan_id = d.get('banti_product'), d.get('banti_plan_id')
-    if not product_name or plan_id is None:
-        bot.send_message(message.chat.id, '❌ Session expired. Open Connect Hack again.')
-        return
-    _set_banti_valid_id(plan_id, text)
-    admin_temp_data.pop(uid, None)
-    bot.send_message(message.chat.id, f'✅ <b>Valid ID saved:</b> <code>{html.escape(text)}</code>', parse_mode='HTML')
-    view, markup = _banti_hack_view(product_name)
-    bot.send_message(message.chat.id, view, parse_mode='HTML', reply_markup=markup)
-
-
 # ==================== 9X API SYSTEM (SINGLE DEVICE ONLY) ====================
 def _ninex_base_url(value=None):
     url = str(value if value is not None else get_setting(NINEX_API_URL_KEY) or NINEX_DEFAULT_API_URL).strip().rstrip('/')
@@ -5560,9 +5285,8 @@ def _ninex_plan_days(value):
     # 9X accepts only its actual 10/20/30-day plans. Never interpret an
     # unrelated label such as "10 Hours" as 10 days.
     text = str(value or '').strip().lower()
-    match = re.fullmatch(r'(10|20|30)\s*days?', text)
-    if match:
-        return int(match.group(1))
+    if re.fullmatch(r'(10|20|30)\s*days?', text):
+        return int(re.search(r'10|20|30', text).group(0))
     if text in {'10', '20', '30'}:
         return int(text)
     return None
@@ -5704,195 +5428,6 @@ def step_save_ninex_url(message):
         f"{'🟢 <b>Connected Successfully!</b>' if ok else '🔴 <b>Not Connect</b>'}\nℹ️ {html.escape(str(detail))}", parse_mode='HTML')
     bot.send_message(message.chat.id, '9️⃣ <b>9X API SYSTEM</b>', parse_mode='HTML', reply_markup=_ninex_api_markup())
 
-LICENCE_HUB_DEFAULT_URL = 'https://licencepanelhub.shop/api/v1'
-
-
-def _licence_hub_config():
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        row = conn.execute(
-            "SELECT api_key,base_url FROM licence_api_settings WHERE id=1"
-        ).fetchone()
-    finally:
-        conn.close()
-    return {
-        'api_key': str(row[0] or '').strip() if row else '',
-        'base_url': str(row[1] or LICENCE_HUB_DEFAULT_URL).strip().rstrip('/') if row else LICENCE_HUB_DEFAULT_URL,
-    }
-
-
-def _licence_hub_api_request(method, path, *, params=None, payload=None, timeout=30):
-    """Call the Licence Panel Hub once; never retry a charge-producing POST."""
-    config = _licence_hub_config()
-    if not config['api_key']:
-        return None, 'Licence Panel Hub API key is not configured.'
-    if not re.match(r'^https?://', config['base_url'], re.I):
-        return None, 'Licence Panel Hub base URL is invalid.'
-    method = str(method or 'GET').upper()
-    headers = {
-        'Authorization': f"Bearer {config['api_key']}",
-        'Accept': 'application/json',
-        'User-Agent': 'RG-Cheat-Shop-Bot/1.0',
-    }
-    if payload is not None:
-        headers['Content-Type'] = 'application/json'
-    try:
-        response = HTTP_SESSION.request(
-            method,
-            f"{config['base_url']}/{str(path or '').lstrip('/')}",
-            params=params,
-            json=payload,
-            headers=headers,
-            timeout=(8, max(5, int(timeout or 30))),
-            allow_redirects=False,
-        )
-        request_id = str(response.headers.get('X-Request-ID', 'unknown'))[:100]
-        try:
-            data = response.json()
-        except Exception:
-            return None, f'HTTP {response.status_code}: expected JSON (request {request_id}).'
-        if not isinstance(data, dict):
-            return None, f'Unexpected API response (request {request_id}).'
-        request_id = str(data.get('request_id') or request_id)[:100]
-        if 200 <= response.status_code < 300 and data.get('success') is True:
-            return data, None
-        raw_error = data.get('error')
-        error = raw_error if isinstance(raw_error, dict) else {}
-        code = str(error.get('code') or 'HTTP_ERROR')[:80]
-        message = str(error.get('message') or 'API request failed')[:250]
-        if method == 'POST' and response.status_code >= 500:
-            hint = ' Verify provider order history before retrying.' if str(path).strip('/') == 'order' else ' Verify reset status before retrying.'
-        else:
-            hint = ''
-        return None, f'HTTP {response.status_code} / {code}: {message} (request {request_id}).{hint}'
-    except requests.RequestException as exc:
-        hint = (' Verify provider order history before retrying.' if str(path).strip('/') == 'order'
-                else ' Verify reset status before retrying.') if method == 'POST' else ''
-        return None, f'Connection failed: {type(exc).__name__}.{hint}'
-
-
-def _licence_hub_data(payload):
-    if not isinstance(payload, dict):
-        return {}
-    data = payload.get('data')
-    return data if isinstance(data, dict) else payload
-
-
-def _licence_hub_product_rows(payload):
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get('data', payload)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ('products', 'items', 'results'):
-            if isinstance(data.get(key), list):
-                return data[key]
-    return []
-
-
-def _licence_hub_reset_rows(payload):
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get('data', payload)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ('reset_apis', 'services', 'items'):
-            if isinstance(data.get(key), list):
-                return data[key]
-    return []
-
-
-def _licence_hub_extract_key(response_data):
-    if not isinstance(response_data, dict):
-        return None
-    candidates = response_data.get('keys') or response_data.get('license_keys')
-    if isinstance(candidates, list) and candidates:
-        candidate = candidates[0]
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-        if isinstance(candidate, dict):
-            for field in ('license_key', 'key', 'license'):
-                if candidate.get(field):
-                    return str(candidate[field]).strip()
-    for field in ('license_key', 'key', 'license'):
-        if response_data.get(field):
-            return str(response_data[field]).strip()
-    for field in ('order', 'data'):
-        nested = response_data.get(field)
-        if isinstance(nested, dict):
-            key = _licence_hub_extract_key(nested)
-            if key:
-                return key
-    return None
-
-
-def _licence_hub_plan_variant(plan_id):
-    try:
-        plan_id = int(plan_id)
-    except (TypeError, ValueError):
-        return None
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        row = conn.execute(
-            '''SELECT lm.variant_id FROM licence_plan_map lm
-               JOIN products p ON p.id=lm.local_plan_id WHERE lm.local_plan_id=?''',
-            (plan_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    try:
-        variant_id = int(row[0]) if row else 0
-    except (TypeError, ValueError):
-        return None
-    return variant_id if variant_id > 0 else None
-
-
-def _licence_hub_source_ready_for_plan(product_name, plan_id=None):
-    if plan_id is None or not product_name:
-        return False
-    config = _licence_hub_config()
-    return bool(config['api_key'] and _licence_hub_plan_variant(plan_id))
-
-
-def _licence_hub_generate_key(plan_id, purchase_ref=None):
-    """Validate a mapped variant with GET /stock, then make one POST /order."""
-    variant_id = _licence_hub_plan_variant(plan_id)
-    if not variant_id:
-        return None
-    if not _licence_hub_config()['api_key']:
-        print(f'[LICENCE HUB] Missing API key for plan_id={plan_id}')
-        return None
-
-    stock_payload, stock_error = _licence_hub_api_request('GET', f'/stock/{variant_id}', timeout=20)
-    if stock_error:
-        print(f'[LICENCE HUB] Stock preflight failed plan_id={plan_id} variant_id={variant_id}: {stock_error}')
-        return None
-    stock_data = _licence_hub_data(stock_payload)
-    try:
-        stock = stock_data.get('stock')
-        stock_mode = str(stock_data.get('stock_mode') or '').strip().casefold()
-        if stock is not None and float(stock) <= 0 and stock_mode not in {'provider', 'external', 'unlimited'}:
-            print(f'[LICENCE HUB] Variant is out of stock variant_id={variant_id}')
-            return None
-    except (TypeError, ValueError):
-        pass
-
-    # /order may debit the provider balance. This POST is intentionally sent
-    # once only; an ambiguous timeout must never trigger an automatic retry.
-    order_payload, order_error = _licence_hub_api_request(
-        'POST', '/order', payload={'variant_id': variant_id, 'quantity': 1}, timeout=60
-    )
-    key_value = _licence_hub_extract_key(order_payload)
-    if order_error or not key_value:
-        detail = order_error or 'Order completed without a key; check provider order history.'
-        print(f'[LICENCE HUB] Order failed plan_id={plan_id} variant_id={variant_id}: {detail}')
-        return None
-    print(f'[LICENCE HUB] Key delivered plan_id={plan_id} variant_id={variant_id}')
-    return key_value
-
-
 def _api_source_ready_for_plan(product_name, plan_id=None, local_pid_id=None):
     """Return True only when an actually configured/connected API can deliver.
 
@@ -5901,8 +5436,6 @@ def _api_source_ready_for_plan(product_name, plan_id=None, local_pid_id=None):
     backward compatibility during an actual delivery request.
     """
     return any((
-        _banti_source_ready_for_plan(product_name, plan_id),
-        _licence_hub_source_ready_for_plan(product_name, plan_id),
         _ninex_source_ready_for_plan(product_name, plan_id),
         _tobix_source_ready_for_plan(product_name, plan_id),
         _multi_api_source_ready(product_name, plan_id),
@@ -6055,104 +5588,6 @@ def get_user_orders(user_id):
     orders = cursor.fetchall()
     conn.close()
     return orders
-
-# Order History shows only recent purchases so the Telegram message never goes
-# over the 4096-character limit. Older purchases stay in the database and are
-# available through the "Download All Keys" file.
-ORDER_HISTORY_RECENT_DAYS = 3
-ORDER_HISTORY_MAX_TEXT_CHARS = 3600
-_orders_download_last = {}
-
-def get_user_orders_full(user_id):
-    """All orders of a user with the machine-readable purchase time (newest first)."""
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        rows = conn.execute(
-            "SELECT order_id, product_name, plan_days, price_paid, purchased_key, date_time, "
-            "COALESCE(purchased_at,'') FROM order_history WHERE user_id = ? ORDER BY id DESC",
-            (user_id,)
-        ).fetchall()
-    finally:
-        conn.close()
-    return rows
-
-def get_user_recent_orders(user_id, days=ORDER_HISTORY_RECENT_DAYS):
-    """Orders from the last ``days`` days, in the same 6-column shape as get_user_orders."""
-    now = _now_ist()
-    if getattr(now, 'tzinfo', None):
-        now = now.replace(tzinfo=None)
-    cutoff = now - datetime.timedelta(days=days)
-    recent = []
-    for row in get_user_orders_full(user_id):
-        order_id, product_name, plan_days, price, key_val, date_text, purchased_at = row
-        bought = None
-        try:
-            bought = datetime.datetime.strptime(str(purchased_at).strip(), '%Y-%m-%d %H:%M:%S')
-        except (TypeError, ValueError):
-            # Older rows only have text like "Oct 29 · 14:30 IST".
-            try:
-                m = re.match(r'\s*([A-Za-z]{3})\s+(\d{1,2})\s*·\s*(\d{1,2}):(\d{2})', str(date_text))
-                if m:
-                    bought = datetime.datetime.strptime(
-                        f"{now.year} {m.group(1)} {int(m.group(2))} {m.group(3)}:{m.group(4)}",
-                        '%Y %b %d %H:%M')
-                    if bought > now + datetime.timedelta(days=1):
-                        bought = bought.replace(year=now.year - 1)
-            except Exception:
-                bought = None
-        if bought is not None and bought >= cutoff:
-            recent.append((order_id, product_name, plan_days, price, key_val, date_text))
-    return recent
-
-def _order_history_visible_len(text):
-    plain = re.sub(r'<tg-emoji\b[^>]*>(.*?)</tg-emoji>', lambda m: m.group(1), str(text), flags=re.I | re.S)
-    plain = re.sub(r'<[^>]+>', '', plain)
-    return len(html.unescape(plain))
-
-def _build_orders_download_text(user_id):
-    rows = get_user_orders_full(user_id)
-    user = get_user(user_id)
-    total = sum(float(r[3] or 0) for r in rows)
-    lines = [
-        "ALL PURCHASED KEYS",
-        "=" * 40,
-        f"User ID      : {user_id}",
-        f"Generated    : {_now_ist_text()} IST",
-        f"Total Orders : {len(rows)}",
-        f"Total Spent  : Rs {total:.2f}",
-        "=" * 40,
-        "",
-    ]
-    if not rows:
-        lines.append("No purchases found.")
-    for i, (order_id, product_name, plan_days, price, key_val, date_text, purchased_at) in enumerate(rows, 1):
-        lines += [
-            f"#{i}",
-            f"Hack Name : {product_name}",
-            f"Plan/Days : {plan_days}",
-            f"Price     : Rs {float(price or 0):.2f}",
-            f"Order ID  : {order_id}",
-            f"Date      : {purchased_at or date_text}",
-            f"Key       : {key_val or 'N/A'}",
-            "-" * 40,
-        ]
-    return "\n".join(lines) + "\n"
-
-def send_all_keys_file(chat_id, user_id):
-    """Send every purchased key of this user as a .txt document."""
-    last = _orders_download_last.get(user_id, 0)
-    if time.time() - last < 8:
-        return False
-    _orders_download_last[user_id] = time.time()
-    data = io.BytesIO(_build_orders_download_text(user_id).encode('utf-8'))
-    data.name = f"my_keys_{user_id}_{_now_ist_text('%Y%m%d_%H%M')}.txt"
-    count = len(get_user_orders_full(user_id))
-    bot.send_document(
-        chat_id, data,
-        caption=f"📥 <b>All your purchased keys</b>\n🧾 Total orders: <b>{count}</b>\n\nTap the file to open or save it.",
-        parse_mode='HTML'
-    )
-    return True
 
 # ==================== EXACT PHP cURL TO PYTHON CONVERSION ====================
 def _extract_api_key_value(data):
@@ -6403,20 +5838,11 @@ def _new_api_generate_key(server_url, api_key, product_id, valid_id, duration=No
 
 
 def fetch_key_from_api(pid_id, duration, android_id=None, product_name=None, plan_id=None, purchase_ref=None):
-    # Hub-imported plans have their own Variant ID and REST purchase contract.
-    # Resolve them before the generic server router so a later legacy fallback
-    # can never send a Hub plan to a different provider.
-    if _licence_hub_plan_variant(plan_id):
-        return _licence_hub_generate_key(plan_id, purchase_ref=purchase_ref)
-
     route = _resolve_api_route(product_name or '', plan_id, pid_id, duration)
     curr_api_url = route['url']
     curr_api_key = route['api_key']
     remote_product_id = route['product_id']
     valid_id = route.get('valid_id', '')
-
-    if route.get('server_type') == 'banti':
-        return _banti_generate_key(product_name, plan_id, duration, android_id=android_id, purchase_ref=purchase_ref)
 
     if route.get('server_type') == 'ninex':
         return _ninex_generate_key(duration, purchase_ref=purchase_ref, note=f'{product_name or "Product"} | {duration}')
@@ -6656,17 +6082,14 @@ def notify_admins_purchase(user_id, u_name, order_id, prod_name, prod_days, amou
             except Exception:
                 pass
 
-def record_order(order_id, user_id, product_name, plan_days, price_paid, key_val, plan_id=None, delivery_source=''):
+def record_order(order_id, user_id, product_name, plan_days, price_paid, key_val):
     conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
     cursor = conn.cursor()
     date_now = _now_ist_text("%b %d · %H:%M IST")
-    purchased_at = _now_ist_text("%Y-%m-%d %H:%M:%S")
     cursor.execute('''
-        INSERT INTO order_history
-        (order_id,user_id,product_name,plan_days,price_paid,purchased_key,date_time,plan_id,delivery_source,purchased_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-    ''', (order_id, user_id, product_name, plan_days, price_paid, key_val, date_now,
-          int(plan_id or 0), str(delivery_source or ''), purchased_at))
+        INSERT INTO order_history (order_id, user_id, product_name, plan_days, price_paid, purchased_key, date_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (order_id, user_id, product_name, plan_days, price_paid, key_val, date_now))
     cursor.execute('UPDATE users SET orders_count = orders_count + 1, lifetime_spent = lifetime_spent + ? WHERE user_id = ?', (price_paid, user_id))
     conn.commit()
     conn.close()
@@ -6688,7 +6111,7 @@ def _build_stylish_qr_image(payload, size=900):
 
     qr = qrcode.QRCode(
         version=None,
-        error_correction=ERROR_CORRECT_M,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
         box_size=16,
         border=4,
     )
@@ -6698,7 +6121,7 @@ def _build_stylish_qr_image(payload, size=900):
     qr_img = qr.make_image(
         fill_color="black",
         back_color="white",
-    ).get_image().convert("RGB")
+    ).convert("RGB")
 
     qr_img = qr_img.resize((size, size), Image.Resampling.NEAREST)
 
@@ -6746,7 +6169,7 @@ def _decode_qr_payload_from_url(qr_url):
         return None
 
 
-def _extract_gateway_qr_payload(data, qr_url, order_id, amount, fam_upi):
+def _extract_gateway_qr_payload(data, qr_url, order_id, amount):
     """Prefer the gateway's own payload; otherwise decode its QR image."""
     if isinstance(data, dict):
         for key in (
@@ -6769,87 +6192,127 @@ def _extract_gateway_qr_payload(data, qr_url, order_id, amount, fam_upi):
 
     # Same receiver/order/amount fields as the original fallback QR.
     return (
-        f"upi://pay?pa={urllib.parse.quote(fam_upi, safe='@')}"
+        f"upi://pay?pa={urllib.parse.quote(_fam_upi, safe='@')}"
         f"&pn={urllib.parse.quote(BOT_BRAND_NAME)}"
         f"&am={float(amount):.2f}&cu=INR"
         f"&tn={urllib.parse.quote(str(order_id))}"
     )
 
 
-def create_fam_qr(amount):
-    """Create a FamPay order (GET /api/create_order.php) and return the bot's own
-    black/white QR image together with the gateway's order_id."""
-    amount = round(float(amount), 2)
-    if not amount > 0:
-        raise RuntimeError('Invalid UPI amount.')
-    upi, key = _fam_credentials()
-    if not key:
-        raise RuntimeError('FamPay API token is not configured.')
-    last_error = 'FamPay could not create the payment order. Please try again.'
-    for attempt in range(2):
-        status, data, err = _fam_get('create_order.php', {'amount': f'{amount:.2f}', 'api_key': key}, timeout=12)
-        if err:
-            last_error = err
-            time.sleep(1)
-            continue
-        if status in (401, 403):
-            raise RuntimeError('FamPay rejected the API token. Re-enter it in the FamPay Gateway settings.')
-        if status is not None and status >= 500:
-            last_error = 'FamPay gateway is temporarily unavailable. Please try again.'
-            time.sleep(1)
-            continue
-        body = data.get('data') if isinstance(data.get('data'), dict) else {}
-        ok = data.get('status') is True or str(data.get('status') or '').lower() == 'success'
-        if not (ok and body.get('order_id')):
-            msg = _fam_message(data)
-            print(f'[FAMPAY] create_order rejected (HTTP {status}): {msg}')
-            raise RuntimeError('FamPay: ' + msg if msg else last_error)
-        order_id = str(body['order_id'])
-        if body.get('amount') not in (None, '') and not _fam_amount_equals(body.get('amount'), amount):
-            raise RuntimeError('FamPay returned a different amount for this order.')
-        qr_url = str(body.get('qr_url') or body.get('qr') or '').strip()
-        try:
-            qr_host = (urllib.parse.urlparse(qr_url).hostname or '').lower()
-            base_host = (urllib.parse.urlparse(_fam_base_url()).hostname or '').lower()
-        except Exception:
-            qr_host = base_host = ''
-        if not (qr_url.startswith('https://') and qr_host and (qr_host == base_host or qr_host.endswith('.' + base_host))):
-            qr_url = ''   # never fetch or show images from an untrusted host
-        payee = str(body.get('upi_id') or upi).strip()
-        if not payee and not qr_url:
-            raise RuntimeError('FamPay UPI ID is not configured.')
-        payload = _extract_gateway_qr_payload(body, qr_url, order_id, amount, payee)
-        try:
-            return _build_stylish_qr_image(payload), order_id
-        except Exception as style_error:
-            print(f'[FAMPAY] styled QR failed: {style_error}')
-            if qr_url:
-                return qr_url, order_id
-            raise RuntimeError('FamPay QR could not be generated.')
-    raise RuntimeError(last_error)
+def _legacy_create_fam_qr(amount):
+    """Create a FAM order and return a styled QR image + the same order id.
 
-def verify_fam_order(order_id):
-    """GET /api/verify.php. Paid only when status is success and the amount matches."""
-    upi, key = _fam_credentials()
-    order_id = str(order_id or '')
-    if not key or not order_id:
+    The gateway still creates the real order and verify_fam_order() still checks
+    that exact order id. Only the visual QR image is changed.
+    """
+    amount = float(amount)
+    _fam_cfg = _gateway_row("fam")
+    _fam_api_key = (_fam_cfg[2] if _fam_cfg and _fam_cfg[2] else (_fam_cfg[3] if _fam_cfg and _fam_cfg[3] else FAM_API_KEY))
+    _fam_upi = (_fam_cfg[1] if _fam_cfg and _fam_cfg[1] else RECEIVER_UPI)
+
+    try:
+        # Official FamGateway v2 uses /api/qr.php. Keep the older
+        # /create_order.php endpoint as a compatibility fallback for an
+        # explicitly configured legacy gateway.
+        create_urls = []
+        for base in _fam_gateway_base_candidates():
+            create_urls.extend(_fam_endpoint_candidates(base, 'qr.php'))
+            create_urls.extend(_fam_endpoint_candidates(base, 'create_order.php'))
+        create_urls = list(dict.fromkeys(create_urls))
+
+        last_error = None
+        for endpoint_url in create_urls:
+            try:
+                res = HTTP_SESSION.get(
+                    endpoint_url,
+                    params={"amount": f"{amount:.2f}", "api_key": _fam_api_key},
+                    timeout=10,
+                )
+                if res.status_code in (401, 403):
+                    raise RuntimeError('FamGateway API token was rejected.')
+                res.raise_for_status()
+                res_json = res.json()
+                data = res_json.get("data") or {}
+
+                if res_json.get("status") == "success" or res_json.get("status") is True:
+                    qr_url = data.get("qr_url") or data.get("qr")
+                    order_id = data.get("order_id")
+
+                    if qr_url and order_id:
+                        payload = _extract_gateway_qr_payload(
+                            data, qr_url, order_id, amount
+                        )
+                        try:
+                            return _build_stylish_qr_image(payload), str(order_id)
+                        except Exception as style_error:
+                            print(f"Styled QR warning: {style_error}")
+
+                        # Absolute final fallback: keep the original gateway QR.
+                        return qr_url, str(order_id)
+                last_error = res_json
+            except Exception as endpoint_error:
+                last_error = endpoint_error
+                continue
+        if last_error:
+            print(f"Gateway QR Error: {last_error}")
+    except Exception as e:
+        print(f"Gateway QR Error: {e}")
+
+    # Original direct-UPI fallback retained for gateway/API outages.
+    order_id = (
+        "FAM"
+        + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        + str(random.randint(1000, 9999))
+    )
+    upi_uri = (
+        f"upi://pay?pa={urllib.parse.quote(_fam_upi, safe='@')}"
+        f"&pn={urllib.parse.quote(BOT_BRAND_NAME)}"
+        f"&am={amount:.2f}&cu=INR&tn={urllib.parse.quote(order_id)}"
+    )
+
+    try:
+        return _build_stylish_qr_image(upi_uri), order_id
+    except Exception as style_error:
+        print(f"Fallback styled QR warning: {style_error}")
+        fallback_qr = (
+            "https://api.qrserver.com/v1/create-qr-code/"
+            f"?size=500x500&data={urllib.parse.quote(upi_uri, safe='')}"
+        )
+        return fallback_qr, order_id
+
+def _legacy_verify_fam_order(order_id):
+    _fam_cfg = _gateway_row("fam")
+    _fam_api_key = (_fam_cfg[2] if _fam_cfg and _fam_cfg[2] else (_fam_cfg[3] if _fam_cfg and _fam_cfg[3] else FAM_API_KEY))
+    if not _fam_api_key or not order_id:
         return False, None, None
-    status, data, err = _fam_get('verify.php', {'order_id': order_id, 'api_key': key}, timeout=10)
-    if err or status in (401, 403) or not data:
-        return False, None, None
-    if not (data.get('status') is True or str(data.get('status') or '').lower() == 'success'):
-        return False, None, None   # pending / expired / not found
-    body = data.get('data') if isinstance(data.get('data'), dict) else {}
-    if body.get('order_id') not in (None, '') and str(body.get('order_id')) != order_id:
-        return False, None, None
-    details = active_orders.get(order_id) or active_orders.get(order_id.upper()) or {}
-    expected = details.get('amount')
-    if expected is not None and body.get('amount') not in (None, '') and not _fam_amount_equals(body.get('amount'), expected):
-        print(f'[FAMPAY] order {order_id} paid amount does not match the order; not credited')
-        return False, None, None
-    utr = re.sub(r'[^A-Za-z0-9._/-]', '', str(body.get('utr') or 'N/A'))[:80] or 'N/A'
-    sender = str(body.get('sender_name') or 'FamPay UPI')
-    return True, utr, sender
+
+    for base in _fam_gateway_base_candidates():
+        for endpoint in ('verify-order.php', 'verify.php'):
+            for verify_url in _fam_endpoint_candidates(base, endpoint):
+                try:
+                    res = HTTP_SESSION.get(
+                        verify_url,
+                        params={'order_id': str(order_id), 'api_key': _fam_api_key},
+                        timeout=10,
+                    )
+                    if res.status_code in (401, 403):
+                        return False, None, None
+                    res_json = res.json()
+                    if res_json.get('status') == 'success' or res_json.get('status') is True:
+                        data = res_json.get('data') or {}
+                        utr = data.get('utr', 'N/A')
+                        sender = data.get('sender_name', 'UPI User')
+                        return True, utr, sender
+                    # A valid endpoint that says pending/expired is a normal
+                    # negative result; do not jump to a different endpoint and
+                    # accidentally reinterpret it.
+                    if res.status_code in (200, 404, 408) and isinstance(res_json, dict):
+                        status = str(res_json.get('status') or '').lower()
+                        if status in {'pending', 'expired', 'not_found'}:
+                            return False, None, None
+                except Exception:
+                    continue
+    return False, None, None
 
 def _handle_paid_key_delivery_failure(chat_id, user_id, order_id, amount, pay_type, product_name, product_days, reason='API did not return a key'):
     """Notify admins and compensate a verified paid order exactly once."""
@@ -6981,19 +6444,15 @@ def process_successful_payment(chat_id, user_id, message_id, order_id, amount, p
             return
 
         key_val = fetch_and_claim_manual_key(prod_name, prod_days)
-        delivery_source = 'manual' if key_val else 'api'
         if not key_val:
             _refresh_multi_api_connection_if_needed(prod_name, int(product[0]))
             key_val = fetch_key_from_api(pid_id, remote_dur, android_id=device_id, product_name=prod_name, plan_id=product[0], purchase_ref=order_id)
-            if key_val and _licence_hub_plan_variant(product[0]):
-                delivery_source = 'licence_hub'
         if not key_val:
-            _handle_paid_key_delivery_failure(chat_id, user_id, order_id, amount, pay_type, prod_name, prod_days, reason='The selected API provider did not return a key for this plan mapping.')
+            _handle_paid_key_delivery_failure(chat_id, user_id, order_id, amount, pay_type, prod_name, prod_days, reason='The API server did not return a key for the configured Product ID / Valid ID.')
             bot.send_message(chat_id, "❌ <b>Payment verified, but key delivery failed.</b>\n\nThe API server did not return a key. Your payment amount has been returned to your wallet automatically.", parse_mode="HTML")
             return
 
-        record_order(order_id, user_id, prod_name, prod_days, amount, key_val,
-                     plan_id=product[0], delivery_source=delivery_source)
+        record_order(order_id, user_id, prod_name, prod_days, amount, key_val)
         notify_admins_purchase(user_id, u_name, order_id, prod_name, prod_days, amount, device_id, pay_type, key_val)
         
         if user and user[12] > 0 and user[15] == 0:
@@ -7076,12 +6535,12 @@ def poll_payment_in_bot(chat_id, user_id, message_id, order_id, amount, pay_type
                 # The order amount is fixed by our own  QR request, so the
                 # successful order ID is already bound to this exact amount.
                 if abs(float(amount) - expected_amount) > 0.01:
-                    time.sleep(_payment_poll_gap(order_gateway))
+                    time.sleep(PAYMENT_POLL_INTERVAL)
                     continue
             active_orders.pop(order_id, None)
             process_successful_payment(chat_id, user_id, message_id, order_id, amount, pay_type, utr, product_id, device_id)
             return
-        time.sleep(_payment_poll_gap(order_gateway))
+        time.sleep(PAYMENT_POLL_INTERVAL)
     
     if order_id in active_orders:
         order_details = active_orders.pop(order_id, None)
@@ -7314,13 +6773,13 @@ def handle_contact_verification(message):
 # The original admin panel source is retained verbatim below so existing labels/text
 # are not discarded while the live menu is organized into categories.
 # @bot.message_handler(commands=['admin'])
-def _start_child_admin_expiry_timer(chat_id, message_id):
+# def _start_child_admin_expiry_timer(chat_id, message_id):
     if BOT_CREATOR_ENABLED or BOT_EXPIRES_AT <= 0:
         return
     key = f'child_admin_expiry:{chat_id}:{message_id}'
     timers = globals().setdefault('_CHILD_ADMIN_EXPIRY_TIMERS', {})
     old = timers.get(key)
-    if old and not old.is_set():
+    if old and old.is_alive():
         return
     stop_event = threading.Event()
     timers[key] = stop_event
@@ -7346,10 +6805,13 @@ def _start_child_admin_expiry_timer(chat_id, message_id):
                     break
                 stop_event.wait(1.0)
         finally:
-            if timers.get(key) is stop_event:
-                timers.pop(key, None)
+            timers.pop(key, None)
     threading.Thread(target=worker, daemon=True, name='child-admin-expiry-live').start()
 
+def admin_panel(message):
+    # Legacy panel source retained verbatim below; live implementation is
+    # defined later in the file.
+    pass
 #     user_id = message.from_user.id
 #     if not _is_admin(user_id):
 #         bot.send_message(message.chat.id, "❌ <b>Access Denied!</b> Only Admin can access this command.", parse_mode="HTML")
@@ -7494,7 +6956,7 @@ def _admin_return_category_for_callback(data):
         return ("hack_server", "")
     if data in {"new_server_api", "admin_api_system", "admin_server_api_mgmt",
                 "api_srv_add", "tobix_api_system", "tobix_set_token", "tobix_set_url",
-                "tobix_check", "tobix_products"} or data.startswith(("api_srv_", "api_check_", "api_test_", "api_balance_", "new_server_", "tobix_", "banti_", "licence_hub")):
+                "tobix_check", "tobix_products"} or data.startswith(("api_srv_", "new_server_", "tobix_")):
         return ("api", "")
 
     # Payment gateway and admin-account screens.
@@ -7517,7 +6979,7 @@ def _admin_return_category_for_callback(data):
     if data.startswith("admin_"):
         if data in {"admin_user_reseller_search", "admin_track_users", "admin_manage_bal", "admin_user_ban_unban",
                     "admin_manage_reseller", "admin_manage_discounts", "admin_user_reset",
-                    "admin_device_id_mgmt"}:
+                    "admin_reset_all_users", "admin_reset_all_users_confirm", "admin_restore_all_users", "admin_restore_all_users_confirm", "admin_device_id_mgmt"}:
             return ("category", "users")
         if data in {"admin_broadcast", "admin_set_guide", "admin_support_settings",
                     "admin_update_link"}:
@@ -7931,7 +7393,7 @@ try:
                 print(f"[ADMIN NEXT-STEP NAV ERROR] {exc}")
             return _ORIGINAL_REGISTER_NEXT_STEP_HANDLER(message, callback, *args, **kwargs)
         bot.register_next_step_handler = _rg_admin_register_next_step_handler
-        setattr(bot, "_rg_admin_nav_wrapped", True)
+        bot._rg_admin_nav_wrapped = True
 except Exception as exc:
     print(f"[ADMIN NEXT-STEP WRAP ERROR] {exc}")
 
@@ -8476,8 +7938,7 @@ def _extract_child_admin_button_catalog(instance_dir):
             key = const_value(bk_node) if bk_node is not None else joined_value(bk_node) if bk_node is not None else None
             cb = const_value(cb_node) if cb_node is not None else joined_value(cb_node) if cb_node is not None else None
             if isinstance(key, str) and key.startswith('admin:'):
-                if isinstance(cb, str):
-                    add(key, label, cb)
+                add(key, label, cb)
 
         elif fn_name == 'InlineKeyboardButton':
             label = const_value(node.args[0]) if node.args else None
@@ -8884,7 +8345,7 @@ def _show_bot_backup_target(call, instance_id):
     finally:
         conn.close()
     if not row:
-        _admin_ui_send(call, '❌ <b>Bot instance not found.</b>', parse_mode='HTML', reply_markup=_bot_backup_list_markup()[0])
+        _admin_ui_send(call, '❌ <b>Bot instance not found.</b>', parse_mode='HTML', reply_markup=_bot_backup_list_markup())
         return
     bot_name, admin_id, duration_key, expires_at, status, _instance_dir = row
     expiry_text = datetime.datetime.fromtimestamp(float(expires_at)).strftime('%Y-%m-%d %H:%M:%S')
@@ -8977,8 +8438,6 @@ def handle_master_bot_backup_document(message):
     tmp_path = None
     try:
         file_info = bot.get_file(doc.file_id)
-        if not file_info.file_path:
-            raise RuntimeError('Telegram did not return a path for the uploaded backup.')
         raw = bot.download_file(file_info.file_path)
         tmp_dir = Path(tempfile.mkdtemp(prefix='master_backup_'))
         tmp_path = tmp_dir / filename
@@ -9001,10 +8460,10 @@ def handle_master_bot_backup_document(message):
             status_line += f'\n⚠️ <b>Automatic restart warning:</b> <code>{html.escape(restart_error)}</code>\nPlease restart that child bot once.'
         else:
             status_line += '\n🟢 <b>Bot process restarted with the restored data.</b>'
-        bot.send_message(message.chat.id, status_line, parse_mode='HTML', reply_markup=_bot_backup_list_markup()[0])
+        bot.send_message(message.chat.id, status_line, parse_mode='HTML', reply_markup=_bot_backup_list_markup())
     except Exception as exc:
         admin_temp_data.pop(uid, None)
-        bot.send_message(message.chat.id, f'❌ <b>Backup restore failed.</b>\n\n<code>{html.escape(str(exc)[:1500])}</code>', parse_mode='HTML', reply_markup=_bot_backup_list_markup()[0])
+        bot.send_message(message.chat.id, f'❌ <b>Backup restore failed.</b>\n\n<code>{html.escape(str(exc)[:1500])}</code>', parse_mode='HTML', reply_markup=_bot_backup_list_markup())
     finally:
         if tmp_path:
             try:
@@ -9473,7 +8932,7 @@ def _bot_creator_spawn(instance_id, child_dir, env):
         # -u keeps startup errors visible immediately in bot.log.  This is
         # important because the child has its own process and working folder.
         proc = subprocess.Popen(
-            [sys.executable, '-u', str(Path(child_dir) / 'main.py')],
+            [os.sys.executable, '-u', str(Path(child_dir) / 'main.py')],
             cwd=str(child_dir), env=env, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True
         )
@@ -10003,8 +9462,6 @@ def _send_user_reseller_search(call):
         'If several accounts match, all matching accounts will be shown.',
         parse_mode='HTML'
     )
-    if not isinstance(msg, types.Message):
-        return
     bot.register_next_step_handler(msg, _step_user_reseller_search)
 
 def _step_user_reseller_search(message):
@@ -10470,10 +9927,8 @@ def _admin_category_markup(category):
         'api': [
             ("9️⃣ 9X API System", "ninex_api_system"),
             ("🟢 TobiX API System", "tobix_api_system"),
-            (f"🟣 {_banti_name()}", "banti_api_system"),
             ("🆕 New Server API System", "new_server_api"),
             ("🤝 Reseller API System", "resapi_admin"),
-            ("🔌 Admin Licence Manager Hub", "licence_hub"),
         ],
         'emoji': [
             ("🎨 Button Colors", "admin_button_colors"),
@@ -10498,6 +9953,8 @@ def _admin_category_markup(category):
             ("👑 Reseller Discount / Paid Access", "admin_reseller_discount"),
             ("🎟️ Create Coupon", "admin_create_coupon"),
             ("🏷️ Manage Discounts", "admin_manage_discounts"),
+            ("🧹 Reset All Users & Resellers", "admin_reset_all_users"),
+            ("♻️ Restore User Data", "admin_restore_all_users"),
         ],
         'tools': [
             ("📢 Multimedia Broadcast", "admin_broadcast"),
@@ -10549,13 +10006,13 @@ def _start_famp_setup(chat_id, user_id):
         return
     with _famp_setup_lock(user_id):
         admin_temp_data[int(user_id)] = {
-            'famp_setup_stage': 'upi',
-            'gw_upi': '',
+            'famp_setup_stage': 'api_key',
+            'gw_upi': 'ZYVOPAY',
             'gw_api_key': '',
         }
     bot.send_message(
         chat_id,
-        '💳 <b>FAMP GATEWAY</b>\n\nEnter FAMP UPI ID:',
+        '💳 <b>FAMPAY GATEWAY (ZYVO PAY)</b>\n\n🔐 <b>Paste the complete ZYVO PAY API token</b> (the full <code>public.secret</code> value from your ZYVO PAY dashboard).\n\n<i>Only the token is needed. The token is stored privately and the bot verifies the connection automatically. Send /cancel to stop.</i>',
         parse_mode='HTML'
     )
 
@@ -10621,10 +10078,19 @@ def _handle_famp_setup_message(message):
 
         if stage == 'api_key':
             if len(text) < 8 or len(text) > 512:
-                bot.send_message(chat_id, '❌ Invalid API token length. Send the real FAMP API token again.')
+                bot.send_message(chat_id, '❌ Invalid API token length. Send the real ZYVO PAY API token again.')
                 return
+            try:
+                _zyvopay_signing_key(text)
+            except Exception:
+                bot.send_message(chat_id, '❌ Token format is invalid. Paste the complete <code>public.secret</code> token from ZYVO PAY.', parse_mode='HTML')
+                return
+            try:
+                bot.delete_message(chat_id, message.message_id)  # do not leave the secret in chat history
+            except Exception:
+                pass
 
-            upi = str(state.get('gw_upi') or '').strip()
+            upi = 'ZYVOPAY'
             state['gw_api_key'] = text
             try:
                 # Save first so a successful connection check and a process
@@ -10633,7 +10099,7 @@ def _handle_famp_setup_message(message):
                 admin_temp_data.pop(uid, None)
                 bot.send_message(
                     chat_id,
-                    '⏳ <b>FAMP API Token Saved.</b>\n\nChecking API connection now...',
+                    '⏳ <b>ZYVO PAY API Token Saved.</b>\n\nChecking API connection now...',
                     parse_mode='HTML'
                 )
 
@@ -10678,167 +10144,81 @@ def _paytm_setup_lock(user_id):
         return _PAYTM_SETUP_LOCKS.setdefault(uid, threading.RLock())
 
 def _start_paytm_setup(chat_id, user_id):
-    if not _is_admin(user_id):
-        return
+    if not _is_admin(user_id): return
     with _paytm_setup_lock(user_id):
-        admin_temp_data[int(user_id)] = {
-            'paytm_setup_stage': 'upi',
-            'gw_upi': '',
-            'gw_merchant_id': '',
-            'gw_merchant_key': '',
-            'gw_pos_id': '',
-        }
-    bot.send_message(
-        chat_id,
-        '💳 <b>PAYTM GATEWAY</b>\n\nEnter PayTM UPI ID:\n\n<i>After this, the API Token / Merchant Key step will continue automatically.</i>',
-        parse_mode='HTML'
-    )
+        admin_temp_data[int(user_id)] = {'paytm_setup_stage':'upi','gw_upi':'','gw_merchant_key':''}
+    bot.send_message(chat_id, '💳 <b>PAYTM / ZYVO PAY GATEWAY</b>\n\nEnter the UPI ID configured in your ZYVO PAY merchant dashboard:', parse_mode='HTML')
 
 @bot.message_handler(func=lambda message: bool(
-    getattr(message, 'from_user', None) and
-    _is_admin(message.from_user.id) and
+    getattr(message, 'from_user', None) and _is_admin(message.from_user.id) and
     isinstance(admin_temp_data.get(int(message.from_user.id)), dict) and
     admin_temp_data.get(int(message.from_user.id), {}).get('paytm_setup_stage')
 ))
 def _handle_paytm_setup_message(message):
-    uid = int(message.from_user.id)
-    chat_id = message.chat.id
-    text = (message.text or '').strip()
-    command = text.split()[0].lower() if text else ''
-    if command in {'/cancel', '/admin', '/start'}:
-        admin_temp_data.pop(uid, None)
-        try:
-            bot.clear_step_handler_by_chat_id(chat_id)
-        except Exception:
-            pass
-        if command == '/cancel':
-            bot.send_message(chat_id, '✅ <b>PayTM Gateway setup cancelled.</b>', parse_mode='HTML')
-            try:
-                admin_panel(message)
-            except Exception:
-                pass
-        elif command == '/admin':
-            try:
-                admin_panel(message)
-            except Exception:
-                pass
+    uid=int(message.from_user.id); chat_id=message.chat.id; text=(message.text or '').strip()
+    command=text.split()[0].lower() if text else ''
+    if command in {'/cancel','/admin','/start'}:
+        admin_temp_data.pop(uid,None)
+        try: bot.clear_step_handler_by_chat_id(chat_id)
+        except Exception: pass
+        if command=='/cancel': bot.send_message(chat_id,'✅ <b>Gateway setup cancelled.</b>',parse_mode='HTML')
+        elif command=='/admin':
+            try: admin_panel(message)
+            except Exception: pass
         else:
-            try:
-                send_welcome(message)
-            except Exception:
-                pass
+            try: send_welcome(message)
+            except Exception: pass
         return
     if not text:
-        bot.send_message(chat_id, '❌ Please send the requested PayTM value as text.')
-        return
-
-    lock = _paytm_setup_lock(uid)
-    with lock:
-        state = admin_temp_data.get(uid)
-        if not isinstance(state, dict):
+        bot.send_message(chat_id,'❌ Please send text.'); return
+    with _paytm_setup_lock(uid):
+        state=admin_temp_data.get(uid)
+        if not isinstance(state,dict): return
+        stage=state.get('paytm_setup_stage')
+        if stage=='upi':
+            if '@' not in text or len(text)>128:
+                bot.send_message(chat_id,'❌ Invalid UPI ID. Send it again.'); return
+            state['gw_upi']=text; state['paytm_setup_stage']='token'
+            bot.send_message(chat_id,'🔐 <b>Paste the complete ZYVO PAY API token</b> (the full <code>public.secret</code> value from the dashboard).\n\nThe token is stored privately in the bot database and never shown back.',parse_mode='HTML')
             return
-        stage = str(state.get('paytm_setup_stage') or '')
-
-        if stage == 'upi':
-            if '@' not in text or len(text) > 128:
-                bot.send_message(chat_id, '❌ Invalid PayTM UPI ID. Send the UPI ID again.')
-                return
-            state['gw_upi'] = text
-            state['paytm_setup_stage'] = 'merchant_id'
-            bot.send_message(chat_id, '🆔 <b>Enter PayTM Merchant ID (MID):</b>', parse_mode='HTML')
-            return
-
-        if stage == 'merchant_id':
-            if not text or len(text) > 128:
-                bot.send_message(chat_id, '❌ Merchant ID cannot be empty. Send it again.')
-                return
-            state['gw_merchant_id'] = text
-            state['paytm_setup_stage'] = 'merchant_key'
-            bot.send_message(
-                chat_id,
-                '🔐 <b>Enter PayTM API Token / Merchant Key:</b>\n\n<i>This credential is used to sign PayTM API requests and verify payments automatically.</i>',
-                parse_mode='HTML'
-            )
-            return
-
-        if stage == 'merchant_key':
-            if not text or len(text) > 256:
-                bot.send_message(chat_id, '❌ API Token / Merchant Key cannot be empty. Send it again.')
-                return
-            state['gw_merchant_key'] = text
-            state['paytm_setup_stage'] = 'pos_id'
-            bot.send_message(
-                chat_id,
-                '🖥️ <b>Enter PayTM POS ID:</b>\n\nRequired for Dynamic QR payments.',
-                parse_mode='HTML'
-            )
-            return
-
-        if stage == 'pos_id':
-            if not text or len(text) > 128:
-                bot.send_message(chat_id, '❌ POS ID cannot be empty. Send it again.')
-                return
-            state['gw_pos_id'] = text
-            state['paytm_setup_stage'] = 'client_id'
-            current = str(get_setting('paytm_client_id') or PAYTM_DEFAULT_CLIENT_ID).strip() or 'C11'
-            bot.send_message(
-                chat_id,
-                f'🧩 <b>Enter PayTM Client ID:</b>\n\nStandard accounts may use <code>{html.escape(current)}</code>.\nSend <code>SKIP</code> to keep the current Client ID.',
-                parse_mode='HTML'
-            )
-            return
-
-        if stage == 'client_id':
-            client = text
-            if client.upper() == 'SKIP':
-                client = str(get_setting('paytm_client_id') or PAYTM_DEFAULT_CLIENT_ID).strip() or 'C11'
-            if not client or len(client) > 128:
-                bot.send_message(chat_id, '❌ Client ID cannot be empty. Send it again.')
-                return
-
-            upi = state.get('gw_upi', '')
-            mid = state.get('gw_merchant_id', '')
-            key = state.get('gw_merchant_key', '')
-            pos = state.get('gw_pos_id', '')
+        if stage=='token':
+            if '.' not in text or len(text)>512 or not all(text.split('.',1)):
+                bot.send_message(chat_id,'❌ Token format is invalid. Paste the complete public.secret token from ZYVO PAY.'); return
+            upi=state.get('gw_upi','')
             try:
-                _save_gateway('paytm', upi, mid, key)
-                set_setting('paytm_pos_id', pos)
-                set_setting('paytm_client_id', client)
-                admin_temp_data.pop(uid, None)
-                bot.send_message(
-                    chat_id,
-                    '💾 <b>PayTM Gateway Saved Successfully.</b>\n\n'
-                    '🔑 API Token / Merchant Key: <b>Saved</b>\n'
-                    '🖥️ POS ID: <b>Saved</b>\n'
-                    '🧩 Client ID: <b>Saved</b>\n\n'
-                    'PayTM remains <b>OFF</b> until you run Check PayTM Connection and explicitly turn it ON.',
-                    parse_mode='HTML',
-                    reply_markup=_gateway_manager_markup()
-                )
-            except Exception as exc:
-                bot.send_message(
-                    chat_id,
-                    f'❌ <b>PayTM save failed.</b>\n\n<code>{html.escape(str(exc)[:700])}</code>',
-                    parse_mode='HTML'
-                )
-            return
-
-        admin_temp_data.pop(uid, None)
+                # Keep token in the existing encrypted/DB-backed gateway credential field; MID column is not used.
+                _save_gateway('paytm',upi,'ZYVOPAY',text)
+                admin_temp_data.pop(uid,None)
+                bot.send_message(chat_id,'💾 <b>ZYVO PAY credentials saved.</b>\n\nNext, tap <b>Check PayTM Connection</b> to validate the token, then turn the gateway ON. The existing PayTM menu now uses ZYVO PAY API; FamPay remains separate.',parse_mode='HTML',reply_markup=_gateway_manager_markup())
+            except Exception:
+                admin_temp_data.pop(uid,None)
+                bot.send_message(chat_id,'❌ Could not save gateway settings. Please try again.')
 
 
 def _gateway_manager_markup():
     active=_get_active_payment_gateway()
-    m=types.InlineKeyboardMarkup(row_width=1)
-    m.row(make_ui_button(f"{'🟢' if active=='fam' else '⚪'} FamPay Gateway\n{_gateway_status_line('fam')}", callback_data='gw_edit_fam', button_key='admin:gateway:fam_edit', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔍 Check FamPay Connection', callback_data='gw_check_fam', button_key='admin:gateway:fam_check', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔘 FamPay System '+('ON' if active=='fam' else 'OFF'), callback_data='gw_toggle_fam', button_key='admin:gateway:fam_toggle', default_color='green' if active=='fam' else 'red', force_style=True))
+    m=types.InlineKeyboardMarkup(row_width=2)
+    # Clean three-row gateway grid: FamPay on the left, PayTM on the right.
+    # Pending Payments and Back stay full-width below the grid.
+    m.row(
+        make_ui_button(f"{'🟢' if active=='fam' else '⚪'} FamPay Gateway\n{_gateway_status_line('fam')}", callback_data='gw_edit_fam', button_key='admin:gateway:fam_edit', default_color='blue', force_style=True),
+        make_ui_button(f"{'🟢' if active=='paytm' else '⚪'} PayTM Gateway\n{_gateway_status_line('paytm')}", callback_data='gw_edit_paytm', button_key='admin:gateway:paytm_edit', default_color='blue', force_style=True),
+    )
+    m.row(
+        make_ui_button('🔍 Check FamPay\nConnection', callback_data='gw_check_fam', button_key='admin:gateway:fam_check', default_color='blue', force_style=True),
+        make_ui_button('🔍 Check PayTM\nConnection', callback_data='gw_check_paytm', button_key='admin:gateway:paytm_check', default_color='blue', force_style=True),
+    )
+    m.row(
+        make_ui_button('🔘 FamPay System\n'+('ON' if active=='fam' else 'OFF'), callback_data='gw_toggle_fam', button_key='admin:gateway:fam_toggle', default_color='green' if active=='fam' else 'red', force_style=True),
+        make_ui_button('🔘 PayTM System\n'+('ON' if active=='paytm' else 'OFF'), callback_data='gw_toggle_paytm', button_key='admin:gateway:paytm_toggle', default_color='green' if active=='paytm' else 'red', force_style=True),
+    )
     m.row(make_ui_button('⏳ Pending Payments', callback_data='admin_view_pending_payments', button_key='admin:gateway:pending', default_color='blue', force_style=True))
     m.row(make_ui_button('🔙 Main Admin Panel', callback_data='admin_back_main', button_key='admin:navigation:back', default_color='red', force_style=True))
     return m
 
 def _send_gateway_manager(chat_id,message_id=None):
-    active=_get_active_payment_gateway(); label='FamPay' if active=='fam' else ('PayTM' if active=='paytm' else 'None')
-    text=f"💳 <b>PAYMENT GATEWAY</b>\n\n⚡ <b>Active Gateway:</b> {label}\nFamPay handles UPI payments for this bot."
+    active=_get_active_payment_gateway(); label={'fam':'FAMPAY','paytm':'PAYTM'}.get(active,'None')
+    text=f"💳 <b>PAYMENT GATEWAYS</b>\n\n⚡ <b>Active Gateway:</b> {label}\nFamPay and PayTM are stored independently. Only the gateway explicitly switched ON is used for new payments.\nFamPay button: paste only the ZYVO PAY API token. PayTM menu is also connected to ZYVO PAY; save UPI ID + API token and verify the connection."
     markup=_gateway_manager_markup()
     if message_id:
         try: return bot.edit_message_text(text,chat_id=chat_id,message_id=message_id,parse_mode='HTML',reply_markup=markup)
@@ -10889,28 +10269,20 @@ def step_save_paytm_client_id(message):
 
 def _gateway_toggle(chat_id,gateway):
     gateway=str(gateway).lower().strip(); row=_gateway_row(gateway)
-    label={'fam':'FamPay','paytm':'PayTM'}.get(gateway,gateway.upper())
-    if gateway not in {'fam','paytm'}:
-        bot.send_message(chat_id,'❌ <b>Unknown payment gateway.</b>',parse_mode='HTML')
-        _send_gateway_manager(chat_id)
-        return
-    if _get_active_payment_gateway() == gateway:
-        set_setting('active_payment_gateway','')
-        bot.send_message(chat_id,f'⚪ <b>{label} System OFF.</b>',parse_mode='HTML')
-        _send_gateway_manager(chat_id)
-        return
-    configured = bool(row and row[1] and row[2])
-    if not row or not configured:
-        bot.send_message(chat_id,f'❌ <b>{label} is not configured.</b>',parse_mode='HTML'); return
+    if not row or not row[1] or not row[2]:
+        bot.send_message(chat_id,f'❌ <b>{gateway.upper()} is not configured.</b>',parse_mode='HTML'); return
     if not int(row[4] or 0):
-        bot.send_message(chat_id,f'❌ <b>{label} is not connected.</b> Use Check Connection first.',parse_mode='HTML'); return
+        bot.send_message(chat_id,f'❌ <b>{gateway.upper()} is not connected.</b> Use Check Connection first.',parse_mode='HTML'); return
     if gateway=='paytm':
         ready=_paytm_payment_config_error()
         if ready:
             bot.send_message(chat_id,'❌ <b>PayTM cannot be turned ON yet.</b>\n\n'+html.escape(ready),parse_mode='HTML'); return
-    if not _set_active_payment_gateway(gateway):
-        bot.send_message(chat_id,f'❌ <b>{label} could not be activated.</b>',parse_mode='HTML'); return
-    bot.send_message(chat_id,f'🟢 <b>{label} System ON.</b> The other gateway is automatically OFF.',parse_mode='HTML')
+    if _get_active_payment_gateway()==gateway:
+        set_setting('active_payment_gateway',''); bot.send_message(chat_id,f'⚪ <b>{gateway.upper()} System OFF.</b>',parse_mode='HTML')
+    else:
+        if not _set_active_payment_gateway(gateway):
+            bot.send_message(chat_id,f'❌ <b>{gateway.upper()} could not be activated.</b>',parse_mode='HTML'); return
+        bot.send_message(chat_id,f'🟢 <b>{gateway.upper()} System ON.</b> The other gateway is automatically OFF.',parse_mode='HTML')
     _send_gateway_manager(chat_id)
 
 
@@ -11525,485 +10897,6 @@ def _api_server_parse_json(response):
         return {}
 
 
-def _licence_hub_menu_markup():
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        _admin_colorful_button('✏️ Set API Key', callback_data='licence_hub_set_key', color='blue'),
-        _admin_colorful_button('🌐 Set Base URL', callback_data='licence_hub_set_url', color='blue'),
-    )
-    markup.row(
-        _admin_colorful_button('🧪 Test Connection', callback_data='licence_hub_test', color='green'),
-        _admin_colorful_button('💰 Check Balance', callback_data='licence_hub_balance', color='green'),
-    )
-    markup.add(_admin_colorful_button('🧪 Safe Product / Stock Check', callback_data='licence_hub_safe_check', color='blue'))
-    markup.row(
-        _admin_colorful_button('📥 Import All Products', callback_data='licence_hub_import_all', color='green'),
-        _admin_colorful_button('☑️ Select Products', callback_data='licence_hub_import_select', color='blue'),
-    )
-    markup.add(_admin_colorful_button('🔄 Configure Product Reset Services', callback_data='licence_hub_reset_products', color='blue'))
-    markup.row(
-        _admin_colorful_button('🔑 Admin Reset Key', callback_data='licence_hub_reset_key', color='blue'),
-        _admin_colorful_button('🔄 User Reset: ON' if _licence_hub_resets_enabled() else '🔴 User Reset: OFF', callback_data='licence_hub_toggle_user_reset', color='green' if _licence_hub_resets_enabled() else 'red'),
-    )
-    markup.add(_admin_colorful_button('🔙 API & Server Systems', callback_data='admin_api_system', color='red'))
-    return _ensure_admin_back_button(markup)
-
-
-def _licence_hub_screen(call):
-    config = _licence_hub_config()
-    key = config['api_key']
-    masked = ('•' * max(4, len(key) - 4) + key[-4:]) if key else 'Not set'
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        mapped_products = conn.execute('SELECT COUNT(*) FROM licence_product_map').fetchone()[0]
-        mapped_plans = conn.execute('SELECT COUNT(*) FROM licence_plan_map').fetchone()[0]
-    finally:
-        conn.close()
-    reset_state = 'ON' if _licence_hub_resets_enabled() else 'OFF'
-    text = (
-        '🔌 <b>ADMIN LICENCE MANAGER HUB</b>\n'
-        '━━━━━━━━━━━━━━━━━━━━\n\n'
-        f'🔐 <b>API Key:</b> <code>{html.escape(masked)}</code>\n'
-        f'🌐 <b>Base URL:</b> <code>{html.escape(config["base_url"])}</code>\n'
-        f'📦 <b>Mapped products / plans:</b> {mapped_products} / {mapped_plans}\n'
-        f'🔄 <b>User key reset:</b> {reset_state}\n\n'
-        'Hub delivery uses GET <code>/stock/{variant_id}</code> before a single POST <code>/order</code>. '
-        'Safe checks use GET requests only.'
-    )
-    _admin_ui_send(call, text, parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-
-
-def _licence_hub_fetch_all_products():
-    products = []
-    for page in range(1, 101):
-        payload, error = _licence_hub_api_request(
-            'GET', '/products', params={'page': page, 'per_page': 100}, timeout=30
-        )
-        if error:
-            return [], error
-        rows = _licence_hub_product_rows(payload)
-        products.extend(row for row in rows if isinstance(row, dict))
-        raw_meta = payload.get('meta') if isinstance(payload, dict) else None
-        meta = raw_meta if isinstance(raw_meta, dict) else {}
-        raw_data = payload.get('data') if isinstance(payload, dict) else None
-        data = raw_data if isinstance(raw_data, dict) else {}
-        nested_meta = data.get('meta')
-        if not meta and isinstance(nested_meta, dict):
-            meta = nested_meta
-        try:
-            total = int(meta.get('total', len(products)) or len(products))
-        except (TypeError, ValueError):
-            total = len(products)
-        if not rows or len(products) >= total:
-            break
-    return products, None
-
-
-def _licence_hub_import_products(products, selected_ids=None):
-    selected = {str(value) for value in selected_ids} if selected_ids is not None else None
-    imported_products = imported_plans = skipped = invalid = 0
-    now_text = _now_ist_text()
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=20)
-    try:
-        conn.execute('BEGIN IMMEDIATE')
-        for product in products:
-            if not isinstance(product, dict):
-                invalid += 1
-                continue
-            raw_external_id = product.get('product_id', product.get('id'))
-            if raw_external_id is None or raw_external_id == '':
-                invalid += 1
-                continue
-            try:
-                external_id = str(int(raw_external_id))
-            except (TypeError, ValueError):
-                invalid += 1
-                continue
-            if selected is not None and external_id not in selected:
-                continue
-            product_name = str(product.get('name') or product.get('code') or f'Product {external_id}').strip()[:200]
-            if not product_name:
-                invalid += 1
-                continue
-
-            mapped = conn.execute(
-                'SELECT local_product_name FROM licence_product_map WHERE external_product_id=?', (external_id,)
-            ).fetchone()
-            if mapped and conn.execute('SELECT 1 FROM products WHERE name=? LIMIT 1', (mapped[0],)).fetchone():
-                product_name = str(mapped[0])
-            else:
-                same_name = conn.execute(
-                    'SELECT name FROM products WHERE LOWER(TRIM(name))=LOWER(TRIM(?)) ORDER BY id LIMIT 1',
-                    (product_name,),
-                ).fetchone()
-                if same_name:
-                    product_name = str(same_name[0])
-            existed = conn.execute('SELECT 1 FROM products WHERE name=? LIMIT 1', (product_name,)).fetchone()
-            conn.execute(
-                '''INSERT INTO licence_product_map(external_product_id,local_product_name,updated_at)
-                   VALUES(?,?,?) ON CONFLICT(external_product_id) DO UPDATE SET
-                   local_product_name=excluded.local_product_name,updated_at=excluded.updated_at''',
-                (external_id, product_name, now_text),
-            )
-            if not existed:
-                imported_products += 1
-
-            raw_plans = product.get('plans')
-            plans = raw_plans if isinstance(raw_plans, list) else []
-            seen_variants = set()
-            for plan in plans:
-                if not isinstance(plan, dict):
-                    continue
-                raw_variant_id = plan.get('variant_id')
-                if raw_variant_id is None or raw_variant_id == '':
-                    invalid += 1
-                    continue
-                try:
-                    variant_id = int(raw_variant_id)
-                except (TypeError, ValueError):
-                    invalid += 1
-                    continue
-                if variant_id <= 0 or variant_id in seen_variants:
-                    continue
-                seen_variants.add(variant_id)
-                existing_variant = conn.execute(
-                    'SELECT local_plan_id,external_product_id FROM licence_plan_map WHERE variant_id=?',
-                    (str(variant_id),),
-                ).fetchone()
-                if existing_variant:
-                    if str(existing_variant[1]) == external_id:
-                        skipped += 1
-                    else:
-                        invalid += 1
-                    continue
-
-                duration = plan.get('duration')
-                unit = str(plan.get('duration_unit') or 'days').strip()
-                if duration not in (None, ''):
-                    days = f'{duration} {unit}'.strip()
-                else:
-                    days = str(plan.get('name') or plan.get('validity') or f'Variant {variant_id}').strip()
-                raw_price = plan.get('price')
-                if raw_price is None or raw_price == '':
-                    invalid += 1
-                    continue
-                try:
-                    price = float(raw_price)
-                    if price < 0:
-                        raise ValueError
-                except (TypeError, ValueError):
-                    invalid += 1
-                    continue
-
-                local = conn.execute(
-                    '''SELECT p.id FROM products p
-                       LEFT JOIN licence_plan_map lm ON lm.local_plan_id=p.id
-                       WHERE p.name=? AND LOWER(TRIM(p.days))=LOWER(TRIM(?)) AND lm.local_plan_id IS NULL
-                       ORDER BY p.id LIMIT 1''',
-                    (product_name, days),
-                ).fetchone()
-                if local:
-                    local_plan_id = int(local[0])
-                else:
-                    display_order = conn.execute('SELECT COALESCE(MAX(display_order),0)+1 FROM products').fetchone()[0]
-                    cur = conn.execute(
-                        '''INSERT INTO products(name,pid_id,days,price,resell_price,is_manual,discount_percent,
-                                                remote_duration,tg_group_link,is_out_of_stock,require_device_id,display_order)
-                           VALUES(?,?,?,?,?,0,0,?,'',0,0,?)''',
-                        (product_name, '0', days, price, price, days, int(display_order or 1)),
-                    )
-                    if cur.lastrowid is None:
-                        raise RuntimeError('Database did not return the inserted plan ID.')
-                    local_plan_id = cur.lastrowid
-                try:
-                    conn.execute(
-                        '''INSERT INTO licence_plan_map(local_plan_id,external_product_id,variant_id,updated_at)
-                           VALUES(?,?,?,?)''',
-                        (local_plan_id, external_id, str(variant_id), now_text),
-                    )
-                    imported_plans += 1
-                except sqlite3.IntegrityError:
-                    skipped += 1
-
-            if not existed:
-                conn.execute(
-                    '''INSERT INTO product_visibility(product_name,hidden,updated_at) VALUES(?,1,?)
-                       ON CONFLICT(product_name) DO UPDATE SET hidden=1,updated_at=excluded.updated_at''',
-                    (product_name, now_text),
-                )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return imported_products, imported_plans, skipped, invalid
-
-
-def _licence_hub_resets_enabled():
-    return str(get_setting('licence_reset_enabled') or '1').strip() == '1'
-
-
-def _licence_hub_reset_products_markup():
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for name in get_unique_products():
-        conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-        try:
-            row = conn.execute(
-                'SELECT reset_id,verified FROM licence_product_reset_settings WHERE product_name=?', (name,)
-            ).fetchone()
-        finally:
-            conn.close()
-        status = '✅' if row and row[1] else ('⚠️' if row and row[0] else '❌')
-        suffix = f" · {row[0]}" if row and row[0] else ''
-        markup.add(_admin_colorful_button(
-            f'{status} {name}{suffix}'[:64], callback_data=f'licence_hub_reset_product_{_ui_hash(name)}',
-            color='green' if row and row[1] else 'blue',
-        ))
-    markup.add(_admin_colorful_button('✅ Check All Reset Mappings', callback_data='licence_hub_check_reset_all', color='green'))
-    markup.add(_admin_colorful_button('🔙 Licence Manager Hub', callback_data='licence_hub', color='red'))
-    return _ensure_admin_back_button(markup)
-
-
-def _licence_hub_reset_product_by_hash(value):
-    for name in get_unique_products():
-        if _ui_hash(name) == str(value):
-            return name
-    return None
-
-
-def _licence_hub_customer_orders(user_id, limit=10):
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        rows = conn.execute(
-            '''SELECT h.id,h.order_id,h.product_name,h.plan_days,h.purchased_key,h.purchased_at,
-                      COALESCE(h.reset_count,0),COALESCE(h.last_reset_at,''),r.reset_id,r.service_name
-               FROM order_history h
-               JOIN products p ON p.id=h.plan_id
-               JOIN licence_plan_map lm ON lm.local_plan_id=h.plan_id
-               JOIN licence_product_reset_settings r ON r.product_name=p.name AND r.verified=1
-               WHERE h.user_id=? AND h.delivery_source='licence_hub' AND COALESCE(h.purchased_key,'')<>''
-               ORDER BY h.id DESC LIMIT ?''',
-            (int(user_id), int(limit)),
-        ).fetchall()
-    finally:
-        conn.close()
-    return [row for row in rows if _licence_hub_order_expiry(row[3], row[5])[0]]
-
-
-def _licence_hub_order_expiry(plan_days, purchased_at):
-    text = str(plan_days or '').strip().casefold()
-    if any(word in text for word in ('lifetime', 'unlimited', 'permanent')):
-        return True, 'Lifetime'
-    match = re.search(r'(\d+)\s*(minute|hour|day|week|month|year)s?', text)
-    if not match:
-        return False, 'Expired'
-    try:
-        bought = datetime.datetime.strptime(str(purchased_at).strip(), '%Y-%m-%d %H:%M:%S')
-    except (TypeError, ValueError):
-        return False, 'Expired'
-    amount, unit = int(match.group(1)), match.group(2)
-    durations = {
-        'minute': datetime.timedelta(minutes=amount), 'hour': datetime.timedelta(hours=amount),
-        'day': datetime.timedelta(days=amount), 'week': datetime.timedelta(weeks=amount),
-        'month': datetime.timedelta(days=30 * amount), 'year': datetime.timedelta(days=365 * amount),
-    }
-    now = _now_ist()
-    if getattr(now, 'tzinfo', None):
-        now = now.replace(tzinfo=None)
-    remaining = bought + durations[unit] - now
-    return remaining.total_seconds() > 0, f'{max(0, int(remaining.total_seconds() // 86400))} day(s)'
-
-
-def _licence_hub_render_import_select(call, page=0):
-    uid = int(call.from_user.id)
-    state = admin_temp_data.setdefault(uid, {})
-    products = state.get('licence_import_products') or []
-    selected = {str(value) for value in state.get('licence_import_selected', [])}
-    per_page = 8
-    total_pages = max(1, (len(products) + per_page - 1) // per_page)
-    page = max(0, min(int(page), total_pages - 1))
-    buttons = types.InlineKeyboardMarkup(row_width=1)
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        mapped_ids = {str(row[0]) for row in conn.execute('SELECT external_product_id FROM licence_product_map').fetchall()}
-    finally:
-        conn.close()
-    for product in products[page * per_page:(page + 1) * per_page]:
-        try:
-            external_id = str(int(product.get('product_id', product.get('id'))))
-        except (TypeError, ValueError):
-            continue
-        name = str(product.get('name') or product.get('code') or f'Product {external_id}')
-        status = '☑️' if external_id in selected else ('✅' if external_id in mapped_ids else '⬜')
-        buttons.add(_admin_colorful_button(
-            f'{status} {name}'[:64], callback_data=f'licence_hub_pick_{external_id}_{page}',
-            color='green' if external_id in mapped_ids else 'blue',
-        ))
-    nav = []
-    if page > 0:
-        nav.append(_admin_colorful_button('⬅️ Previous', callback_data=f'licence_hub_import_page_{page - 1}', color='blue'))
-    if page + 1 < total_pages:
-        nav.append(_admin_colorful_button('Next ➡️', callback_data=f'licence_hub_import_page_{page + 1}', color='blue'))
-    if nav:
-        buttons.row(*nav)
-    buttons.add(_admin_colorful_button(
-        f'✅ Import Selected ({len(selected)})', callback_data='licence_hub_import_selected', color='green'
-    ))
-    buttons.add(_admin_colorful_button('❌ Cancel', callback_data='licence_hub', color='red'))
-    _admin_ui_send(
-        call,
-        f'☑️ <b>SELECT HUB PRODUCTS</b>\n\nSelected: <b>{len(selected)}</b>\nPage: <b>{page + 1}/{total_pages}</b>\n\n'
-        '✅ already mapped · ☑️ selected · ⬜ not selected',
-        parse_mode='HTML', reply_markup=buttons,
-    )
-
-
-def _licence_hub_save_reset_mapping(product_name, reset_id, service_name, verified=True):
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        conn.execute(
-            '''INSERT INTO licence_product_reset_settings(product_name,reset_id,service_name,verified,checked_at)
-               VALUES(?,?,?,?,?) ON CONFLICT(product_name) DO UPDATE SET
-               reset_id=excluded.reset_id,service_name=excluded.service_name,
-               verified=excluded.verified,checked_at=excluded.checked_at''',
-            (str(product_name), str(reset_id), str(service_name or ''), 1 if verified else 0, _now_ist_text()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _licence_hub_normalize_reset_id(value):
-    raw = str(value or '').strip()
-    if raw.isdigit():
-        raw = f'16:{raw}'
-    return raw if re.fullmatch(r'16:[1-9][0-9]*', raw) else ''
-
-
-def _licence_hub_callback_answer(call, text=None, show_alert=False):
-    try:
-        bot.answer_callback_query(call.id, text=text, show_alert=show_alert)
-    except Exception:
-        pass
-
-
-def step_save_licence_hub_setting(message):
-    uid = int(message.from_user.id)
-    if not _is_admin(uid):
-        return
-    state = admin_temp_data.get(uid, {})
-    field = state.get('licence_hub_setting')
-    value = (message.text or '').strip()
-    if field == 'api_key':
-        if value.casefold() == 'clear':
-            value = ''
-        elif not value or any(char.isspace() for char in value) or len(value) > 2048:
-            prompt = bot.send_message(message.chat.id, '❌ Send a valid API key without spaces, or send <code>clear</code>.', parse_mode='HTML')
-            bot.register_next_step_handler(prompt, step_save_licence_hub_setting)
-            return
-    elif field == 'base_url':
-        try:
-            parsed = urllib.parse.urlsplit(value)
-            valid_url = (parsed.scheme in ('http', 'https') and bool(parsed.netloc)
-                         and not parsed.query and not parsed.fragment
-                         and not parsed.username and not parsed.password)
-        except ValueError:
-            valid_url = False
-        if not valid_url:
-            prompt = bot.send_message(message.chat.id, '❌ Send a complete http:// or https:// base URL without query parameters.')
-            bot.register_next_step_handler(prompt, step_save_licence_hub_setting)
-            return
-        value = value.rstrip('/')
-    else:
-        admin_temp_data.pop(uid, None)
-        return bot.send_message(message.chat.id, '❌ Licence Hub setting session expired.')
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    try:
-        conn.execute(f'UPDATE licence_api_settings SET {field}=? WHERE id=1', (value,))
-        conn.commit()
-    finally:
-        conn.close()
-    admin_temp_data.get(uid, {}).pop('licence_hub_setting', None)
-    bot.send_message(
-        message.chat.id,
-        '✅ Licence Panel Hub setting saved.',
-        reply_markup=_licence_hub_menu_markup(),
-    )
-
-
-def step_save_licence_hub_reset_product(message):
-    uid = int(message.from_user.id)
-    if not _is_admin(uid):
-        return
-    product_name = admin_temp_data.get(uid, {}).get('licence_hub_reset_product')
-    if not product_name:
-        return bot.send_message(message.chat.id, '❌ Reset mapping session expired.')
-    raw = (message.text or '').strip()
-    if raw.casefold() == 'clear':
-        conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-        try:
-            conn.execute('DELETE FROM licence_product_reset_settings WHERE product_name=?', (product_name,))
-            conn.commit()
-        finally:
-            conn.close()
-        admin_temp_data[uid].pop('licence_hub_reset_product', None)
-        return bot.send_message(message.chat.id, '✅ Reset service disconnected from this product.', reply_markup=_licence_hub_menu_markup())
-
-    reset_id = _licence_hub_normalize_reset_id(raw)
-    if not reset_id:
-        prompt = bot.send_message(message.chat.id, '❌ Send a service ID such as <code>10</code> or <code>16:10</code>, or send <code>clear</code>.', parse_mode='HTML')
-        bot.register_next_step_handler(prompt, step_save_licence_hub_reset_product)
-        return
-    services_payload, error = _licence_hub_api_request('GET', '/reset-apis', timeout=30)
-    if error:
-        prompt = bot.send_message(message.chat.id, f'❌ Could not verify the reset service:\n<code>{html.escape(error[:400])}</code>', parse_mode='HTML')
-        bot.register_next_step_handler(prompt, step_save_licence_hub_reset_product)
-        return
-    service = next((row for row in _licence_hub_reset_rows(services_payload)
-                    if isinstance(row, dict) and _licence_hub_normalize_reset_id(row.get('reset_id')) == reset_id), None)
-    if not service:
-        prompt = bot.send_message(message.chat.id, f'❌ <code>{html.escape(reset_id)}</code> was not returned by <code>/reset-apis</code>. Try a listed service or send <code>clear</code>.', parse_mode='HTML')
-        bot.register_next_step_handler(prompt, step_save_licence_hub_reset_product)
-        return
-    service_name = str(service.get('name') or service.get('service_name') or product_name).strip()
-    _licence_hub_save_reset_mapping(product_name, reset_id, service_name, verified=True)
-    admin_temp_data[uid].pop('licence_hub_reset_product', None)
-    bot.send_message(
-        message.chat.id,
-        f'✅ <b>Reset service connected</b>\n\nProduct: <b>{html.escape(product_name)}</b>\nService: <b>{html.escape(service_name)}</b>\nReset ID: <code>{html.escape(reset_id)}</code>',
-        parse_mode='HTML', reply_markup=_licence_hub_menu_markup(),
-    )
-
-
-def step_licence_hub_admin_reset_key(message):
-    uid = int(message.from_user.id)
-    if not _is_admin(uid):
-        return
-    state = admin_temp_data.get(uid, {})
-    reset_id = str(state.get('licence_hub_admin_reset_id') or '')
-    key = (message.text or '').strip()
-    if not reset_id:
-        return bot.send_message(message.chat.id, '❌ Reset service session expired.')
-    if not 3 <= len(key) <= 255:
-        prompt = bot.send_message(message.chat.id, '❌ Enter a valid licence key (3 to 255 characters).')
-        bot.register_next_step_handler(prompt, step_licence_hub_admin_reset_key)
-        return
-    payload, error = _licence_hub_api_request(
-        'POST', '/reset-key', payload={'reset_id': reset_id, 'key': key}, timeout=45
-    )
-    admin_temp_data[uid].pop('licence_hub_admin_reset_id', None)
-    if error:
-        return bot.send_message(
-            message.chat.id,
-            f'❌ <b>Reset failed</b>\n\n<code>{html.escape(error[:500])}</code>',
-            parse_mode='HTML', reply_markup=_licence_hub_menu_markup(),
-        )
-    result = _licence_hub_data(payload)
-    detail = str(result.get('message') or payload.get('message') or 'Licence key reset successfully.')
-    bot.send_message(message.chat.id, f'✅ <b>{html.escape(detail)}</b>', parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-
-
 def _api_server_test_connection(server_id):
     row = _api_server_row(server_id)
     if not row:
@@ -12081,119 +10974,6 @@ def _api_server_test_connection(server_id):
 
     _api_server_set_enabled(server_id, False)
     return False, detail[:300]
-
-
-def _api_server_extract_balance(data):
-    """Return the first balance field found in a v1 or legacy API response."""
-    if not isinstance(data, dict):
-        return None
-
-    pending = [data]
-    seen = set()
-    balance_keys = ("balance", "wallet_balance", "available_balance", "credit_balance")
-    nested_keys = ("data", "account", "user", "reseller", "profile", "credits", "wallet")
-    while pending:
-        current = pending.pop(0)
-        if not isinstance(current, dict) or id(current) in seen:
-            continue
-        seen.add(id(current))
-        for key in balance_keys:
-            value = current.get(key)
-            if value is not None and not isinstance(value, (dict, list)):
-                return str(value).strip()
-        for key in nested_keys:
-            value = current.get(key)
-            if isinstance(value, dict):
-                pending.append(value)
-    return None
-
-
-def _api_server_balance_response(response):
-    """Validate a successful balance response without guessing missing values."""
-    raw = str(getattr(response, "text", "") or "")[:500]
-    if response.status_code != 200:
-        return False, f"HTTP {response.status_code}: {raw}"
-
-    payload = _api_server_parse_json(response)
-    if isinstance(payload, dict) and (payload.get("success") is False or payload.get("error")):
-        message = payload.get("message") or payload.get("error") or raw
-        return False, str(message)[:300]
-
-    balance = _api_server_extract_balance(payload)
-    if balance is None:
-        match = re.search(
-            r"(?i)\b(?:wallet\s+)?balance\b\s*[:=]\s*(?:INR\s*)?(-?\d[\d,]*(?:\.\d+)?)",
-            raw,
-        )
-        if match:
-            balance = match.group(1)
-
-    if balance is None:
-        return False, f"HTTP 200, but the response contained no balance field: {raw}"
-    return True, f"Balance: {balance}"
-
-
-def _api_server_check_balance(server_id):
-    row = _api_server_row(server_id)
-    if not row:
-        return False, "Server not found."
-
-    _, _, api_key, server_url, *_ = row
-    server_url = _normalize_api_server_url(server_url)
-    headers = {
-        "Authorization": f"Bearer {str(api_key or '').strip()}",
-        "Accept": "application/json",
-        "User-Agent": "RG-Cheat-Shop-Bot/1.0",
-    }
-
-    # The current reseller API exposes a read-only authenticated v1 balance route.
-    v1_error = ''
-    try:
-        response = HTTP_SESSION.get(f"{server_url}/api/v1/balance", headers=headers, timeout=10)
-        if response.status_code == 200:
-            return _api_server_balance_response(response)
-        if response.status_code not in (404, 405):
-            return _api_server_balance_response(response)
-    except Exception as exc:
-        v1_error = str(exc)[:250]
-
-    # Keep compatibility with older reseller-style servers, which expose balance
-    # through a form-encoded POST to the server root.
-    try:
-        response = HTTP_SESSION.post(
-            server_url,
-            data={"api_key": str(api_key or "").strip(), "action": "balance"},
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "x-master-key": RESELLER_MASTER_KEY,
-            },
-            timeout=10,
-        )
-        return _api_server_balance_response(response)
-    except Exception as exc:
-        detail = str(exc)[:250]
-        if v1_error:
-            detail = f"{v1_error}; legacy fallback: {detail}"[:300]
-        return False, detail
-
-
-def _api_server_actions_markup(server_id):
-    sid = int(server_id)
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        _admin_colorful_button("Configure Hacks", callback_data=f"api_hacks_{sid}", color="blue"),
-        _admin_colorful_button("Test Connection", callback_data=f"api_test_{sid}", color="green"),
-    )
-    markup.row(
-        _admin_colorful_button("Check Balance", callback_data=f"api_balance_{sid}", color="green"),
-        _admin_colorful_button("Edit Server", callback_data=f"api_edit_{sid}", color="blue"),
-    )
-    markup.row(
-        _admin_colorful_button("Delete Server", callback_data=f"api_delete_{sid}", color="red"),
-        _admin_colorful_button("API Servers", callback_data="new_server_api", color="red"),
-    )
-    return markup
-
 
 def _api_servers_markup():
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -12377,8 +11157,11 @@ def step_save_api_server_url(message):
         parse_mode="HTML",
         reply_markup=types.InlineKeyboardMarkup()
     )
-    # Show the same working server controls immediately after creation.
-    markup = _api_server_actions_markup(sid)
+    # Rebuild keyboard after the success message so the server is immediately usable.
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⚙️ Configure Hacks", callback_data=f"api_hacks_{sid}"))
+    markup.add(types.InlineKeyboardButton("🔍 Check Connection", callback_data=f"api_check_{sid}"))
+    markup.add(types.InlineKeyboardButton("🔙 API Servers", callback_data="new_server_api"))
     bot.send_message(message.chat.id, "🧩 <b>Server Controls</b>", parse_mode="HTML", reply_markup=markup)
 
 
@@ -12415,15 +11198,8 @@ def _resolve_multi_api_route(product_name, plan_id=None, local_pid_id=None, dura
 
 # Replace route resolution at runtime with a wrapper that preserves the old
 # New Server and Old Server fallbacks exactly as before.
+_legacy_resolve_api_route = _resolve_api_route
 def _resolve_api_route(product_name, plan_id=None, local_pid_id=None, duration=None):
-    # Banti has the highest priority: while a hack is enabled for Banti, every
-    # other server stays on hold for that hack. Disable it to go back.
-    if (product_name and not _product_hidden(product_name) and _banti_product_enabled(product_name)
-            and _banti_api_token() and _banti_base_url() and _banti_connected()
-            and _banti_product_id(product_name)):
-        return {'url': _banti_base_url(), 'api_key': _banti_api_token(),
-                'product_id': _banti_product_id(product_name),
-                'valid_id': _banti_valid_id(plan_id), 'server_type': 'banti'}
     if product_name and _ninex_product_enabled(product_name) and _ninex_api_token() and _ninex_base_url():
         return {'url': _ninex_base_url(), 'api_key': _ninex_api_token(), 'product_id': '', 'valid_id': '', 'server_type': 'ninex'}
     if (product_name and not _product_hidden(product_name) and _tobix_product_enabled(product_name)
@@ -12715,12 +11491,9 @@ def _broadcast_store_batch(source_chat_id, source_message_id, deliveries):
         raw = json.dumps([{'chat_id': int(c), 'message_id': int(m)} for c,m in deliveries], ensure_ascii=False, separators=(',', ':'))
         cur = conn.execute(
             'INSERT INTO broadcast_history(created_at,source_chat_id,source_message_id,sent_count,deleted,deliveries_json) VALUES(?,?,?,?,0,?)',
-            (_now_ist_text(), int(source_chat_id), int(source_message_id) if source_message_id is not None else 0, len(deliveries), raw)
+            (_now_ist_text(), int(source_chat_id), int(source_message_id or 0), len(deliveries), raw)
         )
-        conn.commit()
-        if cur.lastrowid is None:
-            raise RuntimeError('Database did not return the inserted broadcast ID.')
-        return cur.lastrowid
+        conn.commit(); return int(cur.lastrowid)
     finally:
         conn.close()
 
@@ -14285,7 +13058,7 @@ def _coupon_success_template():
 def _coupon_failed_template():
     return _repair_premium_emoji_markup(str(get_setting('coupon_payment_failed_text') or '❌ <b>COUPON PAYMENT FAILED</b>\n\n{reason}'))
 
-def _render_coupon_message(template, product_name='', plan='', amount: float = 0.0, key='', reason=''):
+def _render_coupon_message(template, product_name='', plan='', amount=0, key='', reason=''):
     values = {
         'product_name': html.escape(str(product_name), quote=False),
         'product': html.escape(str(product_name), quote=False),
@@ -14405,14 +13178,12 @@ def _process_coupon_purchase(chat_id,user_id,product_id,device_id,code):
             _bot_make_start_details(chat_id,user_id,order_id)
             return
         key=fetch_and_claim_manual_key(product[1],product[3])
-        delivery_source='manual' if key else 'api'
         if not key:
             _refresh_multi_api_connection_if_needed(product[1],int(product[0])); key=fetch_key_from_api(product[2] or '133',product[8] or product[3],android_id=device_id,product_name=product[1],plan_id=product[0],purchase_ref=order_id)
-            if key and _licence_hub_plan_variant(product[0]): delivery_source='licence_hub'
         if not key:
             _restore_coupon(code,user_id)
             bot.send_message(chat_id,'❌ <b>Key delivery failed.</b>\n\nYour coupon was restored because no key was delivered.',parse_mode='HTML'); return
-        record_order(order_id,user_id,product[1],product[3],price,key,plan_id=product[0],delivery_source=delivery_source)
+        record_order(order_id,user_id,product[1],product[3],price,key)
         try: notify_admins_purchase(user_id,(user or [0,'User'])[1],order_id,product[1],product[3],price,device_id,'coupon',key)
         except Exception: pass
         success=_render_coupon_message(_coupon_success_template(),product_name=product[1],plan=product[3],amount=price,key=key)
@@ -14678,8 +13449,7 @@ def _deliver_product_key_with_fallback(product, order_ref, android_id=None):
         print(f'[API KEY DELIVERY ERROR] product={product_name} plan={plan_days}: {exc}')
         api_key=None
     if api_key:
-        source = 'licence_hub' if _licence_hub_plan_variant(product_id) else 'api'
-        return str(api_key), source
+        return str(api_key), 'api'
     return None, 'none'
 
 
@@ -14929,8 +13699,7 @@ def _reseller_api_purchase_for_user(user_id, product_id, validity_id, idem=''):
         }
 
     try:
-        record_order(order_ref, int(user_id), product[1], product[3], price, key,
-                     plan_id=product[0], delivery_source=delivery_source)
+        record_order(order_ref, int(user_id), product[1], product[3], price, key)
     except Exception as exc:
         print(f'[RESELLER API ORDER RECORD ERROR] {order_ref}: {exc}')
 
@@ -14999,7 +13768,7 @@ class _ResellerAPIServerHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def log_message(self, format, *args):
+    def log_message(self, fmt, *args):
         return
 
     def _auth(self):
@@ -15159,8 +13928,8 @@ def _start_reseller_api_http_server():
         raw_port = (
             os.environ.get('BOT_CHILD_HTTP_PORT')
             if (BOT_INSTANCE_ID and not BOT_CREATOR_ENABLED and os.environ.get('BOT_CHILD_HTTP_PORT'))
-            else (os.environ.get('SERVER_PORT') or os.environ.get('PORT'))
-        ) or '8080'
+            else (os.environ.get('SERVER_PORT') or os.environ.get('PORT') or '8080')
+        )
         port = int(raw_port)
         if not (1 <= port <= 65535):
             raise ValueError(f'invalid port: {port}')
@@ -15460,10 +14229,8 @@ def process_wallet_checkout(chat_id, user_id, product_id, device_id=None, messag
 
         # Key/API delivery can be slow. It stays completely off the Telegram
         # callback worker, while the processing message remains on screen.
-        delivery_source = "api"
         try:
             key_val = fetch_and_claim_manual_key(prod_name, prod_days)
-            delivery_source = "manual" if key_val else "api"
             if not key_val:
                 _refresh_multi_api_connection_if_needed(prod_name, int(product[0]))
                 key_val = fetch_key_from_api(
@@ -15474,8 +14241,6 @@ def process_wallet_checkout(chat_id, user_id, product_id, device_id=None, messag
                     plan_id=product[0],
                     purchase_ref=order_id,
                 )
-                if key_val and _licence_hub_plan_variant(product[0]):
-                    delivery_source = "licence_hub"
         except Exception as api_error:
             print(
                 f"[WALLET KEY/API ERROR] user={user_id} product={product_id} "
@@ -15514,16 +14279,15 @@ def process_wallet_checkout(chat_id, user_id, product_id, device_id=None, messag
                 chat_id,
                 message_id,
                 "❌ <b>Key delivery failed.</b>\n\n"
-                "The selected API provider did not return a key for this plan.\n"
-                "Your wallet balance has been refunded. Please check the provider connection and Variant / Valid ID mapping.",
+                "The API server did not return a key for this Product ID / Valid ID.\n"
+                "Your wallet balance has been refunded. Please check the Product ID and Valid ID mapping.",
             )
             return
 
         # From this point the key exists. Persisting the order and notifying
         # admins must not cause a second wallet charge or a refund.
         try:
-            record_order(order_id, user_id, prod_name, prod_days, final_price, key_val,
-                         plan_id=product[0], delivery_source=delivery_source)
+            record_order(order_id, user_id, prod_name, prod_days, final_price, key_val)
         except Exception as order_error:
             print(f"[WALLET ORDER RECORD ERROR] {order_id}: {order_error}")
 
@@ -15728,7 +14492,7 @@ def show_upi_checkout(chat_id, product_id, message_id=None, device_id=None):
             f"├── 📅 <b>Purchase Date:</b> {html.escape(purchase_date, quote=False)}\n"
             f"└── 🆔 <b>Order ID:</b> <code>{html.escape(str(order_ref), quote=False)}</code>",
             "📱 <b>How to Pay:</b>\n"
-            "├── 1️⃣ Scan the QR Code above using any UPI app\n"
+            "├── 1️⃣ Scan the QR Code above using GPay, PhonePe or FamPay\n"
             f"├── 2️⃣ Pay exact amount: <b>₹{final_price:.2f}</b>\n"
             "└── 3️⃣ Wait a few seconds for auto-verification!",
             "────────────────────────\n"
@@ -16705,50 +15469,6 @@ def _inject_order_history_live_totals(text, user):
     return "\n".join(lines)
 
 
-def _licence_hub_get_user_reset_order(user_id, history_id):
-    try:
-        target_id = int(history_id)
-    except (TypeError, ValueError):
-        return None
-    for row in _licence_hub_customer_orders(user_id, limit=500):
-        if int(row[0]) == target_id:
-            return row
-    return None
-
-
-def _licence_hub_show_user_reset_list(chat_id, user_id, message_id=None):
-    if not _licence_hub_resets_enabled():
-        text = '🔄 <b>Key reset is currently turned off.</b>'
-        markup = types.InlineKeyboardMarkup()
-        markup.add(make_ui_button('🔙 Back to Orders', callback_data='orders', button_key='nav:orders', default_color='blue'))
-        return render_or_edit(chat_id, message_id, text, markup)
-    orders = _licence_hub_customer_orders(user_id)
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for row in orders:
-        history_id, _order_id, product_name, plan_days = row[:4]
-        markup.add(make_ui_button(
-            f'🔄 {product_name} · {plan_days}'[:64],
-            callback_data=f'licence_user_reset_order_{int(history_id)}',
-            button_key='user:licence_reset:order', default_color='green',
-        ))
-    markup.add(make_ui_button('🔙 Back to Orders', callback_data='orders', button_key='nav:orders', default_color='blue'))
-    if not orders:
-        text = '🔄 <b>No active Licence Hub keys are eligible for reset.</b>'
-    else:
-        text = '🔄 <b>RESET LICENCE KEY</b>\n\nSelect one of your active Licence Hub orders. Each key can be reset once per day.'
-    return render_or_edit(chat_id, message_id, text, markup)
-
-
-def _licence_hub_user_reset_notice(call, title, detail):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(make_ui_button('🔙 Back to Reset Menu', callback_data='licence_user_reset_list', button_key='user:licence_reset:back', default_color='blue'))
-    text = f'<b>{html.escape(title)}</b>\n━━━━━━━━━━━━━━━━━━━━\n{html.escape(str(detail))}'
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
-
-
 def show_orders_history(chat_id, user_id, message_id=None):
     user = get_user(user_id)
     lifetime = user[7] if user else 0.0
@@ -16756,102 +15476,87 @@ def show_orders_history(chat_id, user_id, message_id=None):
     deposited = user[8] if user else 0.0
     balance = user[4] if user else 0.0
 
-    # Only the last few days are shown inline (keeps the message under Telegram's
-    # 4096-character limit). Everything is available via "Download All Keys".
-    total_orders_in_db = len(get_user_orders_full(user_id))
-    all_recent = get_user_recent_orders(user_id)
+    # ALWAYS fetch orders by the current Telegram user ID. No shared/sample order
+    # is ever used as live data.
+    orders = get_user_orders(user_id)
+
+    default_history_text = (
+        f"📜 <b>ALL HISTORY</b>\n"
+        f"────────────────────────\n"
+        f"├── 💎 <b>Total spent:</b> ₹{lifetime:.2f} INR ({orders_count} orders)\n"
+        f"└── 📥 <b>Total deposited:</b> ₹{deposited:.2f} INR\n\n"
+        f"🛍️ <b>Recent Orders</b>\n"
+        f"────────────────────────\n"
+    )
 
     history_template = get_custom_text("order_history", "")
     saved_ids = _get_saved_order_history_premium_ids()
 
+    # Migrate Premium IDs from an already-saved template when the recovery cache
+    # is empty. This makes existing installations work without asking the admin
+    # to send the Premium emojis again.
     if history_template:
         template_ids = _premium_emoji_ids_from_template(history_template)
         if template_ids:
             saved_ids = template_ids
             set_setting("order_history_premium_emoji_ids", json.dumps(template_ids, ensure_ascii=False))
         elif saved_ids:
+            # Old/broken saved text contained only normal Unicode emoji. Replace
+            # that renderer with the Premium recovery design automatically.
             recovered = _build_order_history_premium_fallback(saved_ids)
             if recovered:
                 history_template = recovered
 
+    # Recovery path: if there is no usable custom template, rebuild a complete
+    # Premium design from the IDs already saved in the database. No manual Premium
+    # emoji editing is required.
     if not history_template:
         history_template = _build_order_history_premium_fallback(saved_ids)
 
+    if history_template:
+        history_text = _render_order_history_custom_template(history_template, orders)
+    else:
+        history_text = default_history_text + _build_default_live_orders(orders)
+
+    # Live account totals/balance are injected after the visual template render so
+    # the admin can leave those values blank and still get correct per-user data.
+    history_text = _inject_order_history_live_totals(history_text, user)
+
     live_username = _get_live_telegram_username(user_id)
+    history_text = _safe_format_custom_text(
+        history_text,
+        user=(user[1] if user else "User"),
+        name=(user[1] if user else "User"),
+        username=live_username,
+        telegram_username=live_username,
+        user_id=user_id,
+        telegram_id=user_id,
+        phone=(user[2] if user and len(user) > 2 and user[2] else "N/A"),
+        balance=f"{balance:.2f}",
+        ref_balance=f"{user[5]:.2f}" if user else "0.00",
+        orders=orders_count,
+        lifetime=f"{lifetime:.2f}",
+        deposited=f"{deposited:.2f}",
+        orders_list=_build_default_live_orders(orders),
+    )
 
-    def build_text(orders):
-        default_history_text = (
-            f"📜 <b>ALL HISTORY</b>\n"
-            f"────────────────────────\n"
-            f"├── 💎 <b>Total spent:</b> ₹{lifetime:.2f} INR ({orders_count} orders)\n"
-            f"└── 📥 <b>Total deposited:</b> ₹{deposited:.2f} INR\n\n"
-            f"🛍️ <b>Recent Orders</b>\n"
-            f"────────────────────────\n"
-        )
-        if history_template:
-            text = _render_order_history_custom_template(history_template, orders)
-        else:
-            text = default_history_text + _build_default_live_orders(orders)
-
-        text = _inject_order_history_live_totals(text, user)
-        text = _safe_format_custom_text(
-            text,
-            user=(user[1] if user else "User"),
-            name=(user[1] if user else "User"),
-            username=live_username,
-            telegram_username=live_username,
-            user_id=user_id,
-            telegram_id=user_id,
-            phone=(user[2] if user and len(user) > 2 and user[2] else "N/A"),
-            balance=f"{balance:.2f}",
-            ref_balance=f"{user[5]:.2f}" if user else "0.00",
-            orders=orders_count,
-            lifetime=f"{lifetime:.2f}",
-            deposited=f"{deposited:.2f}",
-            orders_list=_build_default_live_orders(orders),
-        )
-        text = _inject_labeled_user_values(
-            text,
-            {
-                "name": html.escape(str(user[1] if user else "User"), quote=False),
-                "username": html.escape(str(live_username), quote=False),
-                "username_at": html.escape(f"@{live_username}" if live_username else "", quote=False),
-                "user_id": str(user_id),
-                "phone": html.escape(str(user[2] if user and len(user) > 2 and user[2] else "N/A"), quote=False),
-                "balance": f"{balance:.2f}",
-                "ref_balance": f"{user[5]:.2f}" if user else "0.00",
-                "orders": str(orders_count),
-                "lifetime": f"{lifetime:.2f}",
-                "deposited": f"{deposited:.2f}",
-            }
-        )
-        return text
-
-    # Drop the oldest orders until the message fits Telegram's limit.
-    shown = list(all_recent)
-    history_text = build_text(shown)
-    while shown and _order_history_visible_len(history_text) > ORDER_HISTORY_MAX_TEXT_CHARS:
-        shown = shown[:-1]
-        history_text = build_text(shown)
-
-    hidden = max(0, total_orders_in_db - len(shown))
-    if hidden > 0:
-        history_text += (
-            f"\n\nℹ️ <i>Showing your latest orders from the last {ORDER_HISTORY_RECENT_DAYS} days. "
-            f"{hidden} older order(s) are in the full file — tap</i> <b>📥 Download All Keys</b>."
-        )
+    history_text = _inject_labeled_user_values(
+        history_text,
+        {
+            "name": html.escape(str(user[1] if user else "User"), quote=False),
+            "username": html.escape(str(live_username), quote=False),
+            "username_at": html.escape(f"@{live_username}" if live_username else "", quote=False),
+            "user_id": str(user_id),
+            "phone": html.escape(str(user[2] if user and len(user) > 2 and user[2] else "N/A"), quote=False),
+            "balance": f"{balance:.2f}",
+            "ref_balance": f"{user[5]:.2f}" if user else "0.00",
+            "orders": str(orders_count),
+            "lifetime": f"{lifetime:.2f}",
+            "deposited": f"{deposited:.2f}",
+        }
+    )
 
     markup = types.InlineKeyboardMarkup()
-    if _licence_hub_resets_enabled() and _licence_hub_customer_orders(user_id):
-        markup.add(make_ui_button(
-            '🔄 Reset Licence Key', callback_data='licence_user_reset_list',
-            button_key='user:licence_reset', default_color='green',
-        ))
-    if total_orders_in_db > 0:
-        markup.add(make_ui_button(
-            '📥 Download All Keys', callback_data='orders_download_all',
-            button_key='user:orders:download', default_color='green',
-        ))
     btn_back = make_ui_button("🔙 Back to Main", callback_data="back_to_main", button_key="nav:back_main", default_color="blue")
     markup.add(btn_back)
 
@@ -17418,8 +16123,7 @@ def _botlist_extend_step(message):
 
 
 @bot.callback_query_handler(func=lambda call: True)
-# This legacy callback router exceeds Pyright's branch-analysis budget.
-def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
+def handle_menu_click(call):
     _activity_log("Button/Callback", call.from_user, getattr(call, "data", ""))
     # Immediate callback acknowledgement keeps Telegram clients responsive even
     # when a later branch performs database/API work.
@@ -17578,116 +16282,6 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
     elif call.data == "orders":
         _fast_callback_ack(call)
         show_orders_history(call.message.chat.id, user_id, message_id=call.message.message_id)
-
-    elif call.data == "orders_download_all":
-        try:
-            sent = send_all_keys_file(call.message.chat.id, user_id)
-            if sent:
-                bot.answer_callback_query(call.id, "✅ File sent! Tap it to open/save.")
-            else:
-                bot.answer_callback_query(call.id, "⏳ Please wait a few seconds.")
-        except Exception as e:
-            try:
-                bot.answer_callback_query(call.id, "❌ Could not create the file. Try again.", show_alert=True)
-            except Exception:
-                pass
-
-    elif call.data == 'licence_user_reset_list':
-        _fast_callback_ack(call)
-        _licence_hub_show_user_reset_list(call.message.chat.id, user_id, message_id=call.message.message_id)
-
-    elif call.data.startswith('licence_user_reset_order_'):
-        if not _licence_hub_resets_enabled():
-            _licence_hub_callback_answer(call, 'Key reset is currently turned off.', show_alert=True)
-            return
-        try:
-            history_id = int(call.data.rsplit('_', 1)[-1])
-        except (TypeError, ValueError):
-            _licence_hub_user_reset_notice(call, '❌ Invalid reset request', 'Open Reset Licence Key again from Order History.')
-            return
-        order = _licence_hub_get_user_reset_order(user_id, history_id)
-        if not order:
-            _licence_hub_user_reset_notice(call, '❌ Key not eligible', 'This order is expired or its reset service is not connected.')
-            return
-        valid, expires_in = _licence_hub_order_expiry(order[3], order[5])
-        if not valid:
-            _licence_hub_user_reset_notice(call, '❌ Key expired', 'This licence key can no longer be reset.')
-            return
-        today = _now_ist_text('%Y-%m-%d')
-        if str(order[7] or '').startswith(today):
-            _licence_hub_user_reset_notice(call, '⚠️ Daily limit reached', 'This key was already reset today. Try again tomorrow.')
-            return
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(make_ui_button('✅ Confirm Reset', callback_data=f'licence_user_reset_confirm_{history_id}', button_key='user:licence_reset:confirm', default_color='green'))
-        markup.add(make_ui_button('🔙 Back', callback_data='licence_user_reset_list', button_key='user:licence_reset:back', default_color='blue'))
-        text = (
-            '🔄 <b>CONFIRM LICENCE KEY RESET</b>\n━━━━━━━━━━━━━━━━━━━━\n'
-            f'📦 <b>Product:</b> {html.escape(str(order[2]))}\n'
-            f'🏷 <b>Plan:</b> {html.escape(str(order[3]))}\n'
-            f'🔑 <b>Key:</b> <code>{html.escape(str(order[4]))}</code>\n'
-            f'⏳ <b>Expires in:</b> {html.escape(expires_in)}\n'
-            f'🔌 <b>Reset service:</b> {html.escape(str(order[9] or order[8]))}\n\n'
-            'This resets devices/HWID bound to the key. One reset per key is allowed each day.'
-        )
-        try:
-            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=markup)
-        except Exception:
-            bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
-
-    elif call.data.startswith('licence_user_reset_confirm_'):
-        if not _licence_hub_resets_enabled():
-            _licence_hub_callback_answer(call, 'Key reset is currently turned off.', show_alert=True)
-            return
-        try:
-            history_id = int(call.data.rsplit('_', 1)[-1])
-        except (TypeError, ValueError):
-            _licence_hub_user_reset_notice(call, '❌ Invalid reset request', 'Open Reset Licence Key again from Order History.')
-            return
-        with licence_reset_processing_lock:
-            if history_id in licence_reset_processing:
-                _licence_hub_callback_answer(call, 'Reset is already processing.', show_alert=True)
-                return
-            licence_reset_processing.add(history_id)
-        try:
-            order = _licence_hub_get_user_reset_order(user_id, history_id)
-            if not order:
-                _licence_hub_user_reset_notice(call, '❌ Key not eligible', 'This order is expired or its reset service is not connected.')
-                return
-            valid, _expires_in = _licence_hub_order_expiry(order[3], order[5])
-            if not valid:
-                _licence_hub_user_reset_notice(call, '❌ Key expired', 'This licence key can no longer be reset.')
-                return
-            today = _now_ist_text('%Y-%m-%d')
-            if str(order[7] or '').startswith(today):
-                _licence_hub_user_reset_notice(call, '⚠️ Daily limit reached', 'This key was already reset today. Try again tomorrow.')
-                return
-            reset_id = _licence_hub_normalize_reset_id(order[8])
-            key_value = str(order[4] or '').strip()
-            if not reset_id or not 3 <= len(key_value) <= 255:
-                _licence_hub_user_reset_notice(call, '❌ Invalid reset mapping', 'The saved product reset service or licence key is invalid. Contact support.')
-                return
-            payload, error = _licence_hub_api_request(
-                'POST', '/reset-key', payload={'reset_id': reset_id, 'key': key_value}, timeout=45
-            )
-            if error:
-                _licence_hub_user_reset_notice(call, '❌ Reset failed', f'{error[:350]} Try again later or contact support.')
-                return
-            reset_time = _now_ist_text('%Y-%m-%d %H:%M:%S')
-            conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-            try:
-                conn.execute(
-                    'UPDATE order_history SET reset_count=COALESCE(reset_count,0)+1,last_reset_at=? WHERE id=? AND user_id=?',
-                    (reset_time, history_id, int(user_id)),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-            result = _licence_hub_data(payload)
-            detail = str(result.get('message') or payload.get('message') or 'Licence key reset successfully.')
-            _licence_hub_user_reset_notice(call, '✅ Key reset successfully', detail)
-        finally:
-            with licence_reset_processing_lock:
-                licence_reset_processing.discard(history_id)
 
     elif call.data == "invite_earn":
         _fast_callback_ack(call)
@@ -17965,8 +16559,31 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
         if _is_admin(user_id): _send_gateway_manager(call.message.chat.id, message_id=call.message.message_id)
     elif call.data == "gw_edit_fam":
         if _is_admin(user_id):
-            _fast_callback_ack(call)
             _start_famp_setup(call.message.chat.id, user_id)
+    elif call.data == "gw_edit_paytm":
+        if _is_admin(user_id):
+            _fast_callback_ack(call)
+            _start_paytm_setup(call.message.chat.id, user_id)
+    elif call.data == "gw_check_paytm":
+        if _is_admin(user_id):
+            _fast_callback_ack(call)
+            chat_id = call.message.chat.id
+            message_id = call.message.message_id
+            def _paytm_connection_worker():
+                ok, detail = _check_paytm_connection()
+                try:
+                    bot.send_message(
+                        chat_id,
+                        ("✅" if ok else "❌") +
+                        f" <b>PayTM Connection {'Successful' if ok else 'Failed'}</b>\n\n<code>{html.escape(str(detail))}</code>",
+                        parse_mode='HTML'
+                    )
+                    _send_gateway_manager(chat_id, message_id=message_id)
+                except Exception as exc:
+                    print(f'[PAYTM CONNECTION UI ERROR] {exc}')
+            _run_user_task_async(_paytm_connection_worker)
+    elif call.data == "gw_toggle_paytm":
+        if _is_admin(user_id): _gateway_toggle(call.message.chat.id,"paytm")
     elif call.data == "gw_check_fam":
         if _is_admin(user_id):
             _fast_callback_ack(call)
@@ -17978,21 +16595,15 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                     bot.send_message(
                         chat_id,
                         ("✅" if ok else "❌") +
-                        f" <b>FamPay Connection {'Successful' if ok else 'Failed'}</b>\n\n"
-                        f"<code>{html.escape(str(detail))}</code>",
-                        parse_mode='HTML',
+                        f" <b>FamPay Connection {'Successful' if ok else 'Failed'}</b>\n\n<code>{html.escape(str(detail))}</code>",
+                        parse_mode="HTML"
                     )
                     _send_gateway_manager(chat_id, message_id=message_id)
                 except Exception as exc:
-                    print(f'[FAMPAY CONNECTION UI ERROR] {exc}')
+                    print(f'[FAMP CONNECTION UI ERROR] {exc}')
             _run_user_task_async(_fam_connection_worker)
     elif call.data == "gw_toggle_fam":
-        if _is_admin(user_id): _gateway_toggle(call.message.chat.id, "fam")
-    elif call.data in {"gw_edit_paytm", "gw_check_paytm", "gw_toggle_paytm"}:
-        if _is_admin(user_id):
-            _fast_callback_ack(call)
-            bot.send_message(call.message.chat.id, 'Only FamPay is available in this bot.')
-            _send_gateway_manager(call.message.chat.id, message_id=call.message.message_id)
+        if _is_admin(user_id): _gateway_toggle(call.message.chat.id,"fam")
     elif call.data == "admin_manage_admins":
         if _is_admin(user_id): _send_admin_manager(call.message.chat.id, message_id=call.message.message_id)
     elif call.data == "admin_add_id":
@@ -18322,7 +16933,6 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                 _admin_colorful_button("⚙️ Hack API & Server Manager", callback_data="admin_hack_server_manager", color="blue"),
                 _admin_colorful_button("🔗 Map Server Hack ID & Duration", callback_data="admin_map_server_id", color="green"),
             )
-            markup.add(_admin_colorful_button("🔌 Admin Licence Manager Hub", callback_data="licence_hub", color="green"))
             markup.add(_admin_colorful_button("🔙 Main Admin Panel", callback_data="admin_back_main", color="red"))
             _admin_ui_send(
                 call,
@@ -18330,247 +16940,6 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                 parse_mode="HTML",
                 reply_markup=_ensure_admin_back_button(markup)
             )
-
-    elif call.data == "licence_hub":
-        if _is_admin(user_id):
-            _licence_hub_screen(call)
-
-    elif call.data in {"licence_hub_set_key", "licence_hub_set_url"}:
-        if _is_admin(user_id):
-            field = "api_key" if call.data.endswith("set_key") else "base_url"
-            admin_temp_data.setdefault(user_id, {})['licence_hub_setting'] = field
-            prompt = (
-                "🔑 <b>Send Licence Panel Hub API Key:</b>\n\nSend <code>clear</code> to remove it."
-                if field == 'api_key' else
-                "🌐 <b>Send Licence Panel Hub Base URL:</b>\n\nExample: <code>https://licencepanelhub.shop/api/v1</code>"
-            )
-            message = _admin_ui_send(call, prompt, parse_mode='HTML')
-            bot.register_next_step_handler(message, step_save_licence_hub_setting)
-
-    elif call.data == "licence_hub_test":
-        if _is_admin(user_id):
-            payload, error = _licence_hub_api_request('GET', '/account', timeout=20)
-            if error:
-                _admin_ui_send(
-                    call,
-                    f"❌ <b>Connection test failed</b>\n\n<code>{html.escape(error[:500])}</code>",
-                    parse_mode='HTML', reply_markup=_licence_hub_menu_markup(),
-                )
-            else:
-                data = _licence_hub_data(payload)
-                status = html.escape(str(data.get('status') or 'Connected')[:100])
-                _admin_ui_send(
-                    call,
-                    f"✅ <b>Licence Hub connected</b>\n\nAccount status: <b>{status}</b>",
-                    parse_mode='HTML', reply_markup=_licence_hub_menu_markup(),
-                )
-
-    elif call.data == "licence_hub_balance":
-        if _is_admin(user_id):
-            payload, error = _licence_hub_api_request('GET', '/balance', timeout=20)
-            if error:
-                _admin_ui_send(
-                    call,
-                    f"❌ <b>Balance check failed</b>\n\n<code>{html.escape(error[:500])}</code>",
-                    parse_mode='HTML', reply_markup=_licence_hub_menu_markup(),
-                )
-            else:
-                data = _licence_hub_data(payload)
-                balance = data.get('display_balance', data.get('balance', data.get('wallet_balance', 'Unknown')))
-                currency = data.get('display_currency') or data.get('balance_currency') or data.get('currency') or ''
-                _admin_ui_send(
-                    call,
-                    f"💰 <b>Licence Hub balance</b>\n\n<code>{html.escape(str(balance))} {html.escape(str(currency))}</code>",
-                    parse_mode='HTML', reply_markup=_licence_hub_menu_markup(),
-                )
-
-    elif call.data == "licence_hub_safe_check":
-        if _is_admin(user_id):
-            products, error = _licence_hub_fetch_all_products()
-            if error:
-                _admin_ui_send(call, f"❌ <b>Safe check failed</b>\n\n<code>{html.escape(error[:500])}</code>", parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-            else:
-                variants = []
-                for product in products:
-                    product_name = str(product.get('name') or product.get('code') or 'Product')[:60]
-                    for plan in product.get('plans') if isinstance(product.get('plans'), list) else []:
-                        try:
-                            variant_id = int(plan.get('variant_id'))
-                        except (AttributeError, TypeError, ValueError):
-                            continue
-                        if variant_id > 0:
-                            variants.append((product_name, variant_id, plan.get('stock')))
-                checks = []
-                for product_name, variant_id, catalogue_stock in variants[:100]:
-                    payload, stock_error = _licence_hub_api_request('GET', f'/stock/{variant_id}', timeout=20)
-                    if stock_error:
-                        checks.append(f"❌ {html.escape(product_name)} · <code>{variant_id}</code> · {html.escape(stock_error[:110])}")
-                    else:
-                        data = _licence_hub_data(payload)
-                        stock = data.get('stock', catalogue_stock if catalogue_stock is not None else 'available')
-                        checks.append(f"✅ {html.escape(product_name)} · <code>{variant_id}</code> · Stock: <b>{html.escape(str(stock))}</b>")
-                shown = checks[:20]
-                if len(checks) > len(shown):
-                    shown.append(f"…and {len(checks) - len(shown)} more variants checked.")
-                if len(variants) > 100:
-                    shown.append(f"Limited to the first 100 variants (catalogue has {len(variants)}).")
-                text = (
-                    f"🧪 <b>SAFE HUB CHECK</b>\n\nProducts: <b>{len(products)}</b>\nVariants checked: <b>{min(len(variants), 100)}</b>\n\n"
-                    + ("\n".join(shown) if shown else 'No valid variants were returned.')
-                    + "\n\n<i>This check called GET endpoints only. It did not call /order or generate a key.</i>"
-                )
-                _admin_ui_send(call, text, parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-
-    elif call.data in {"licence_hub_import_all", "licence_hub_import_select"}:
-        if _is_admin(user_id):
-            products, error = _licence_hub_fetch_all_products()
-            if error:
-                _admin_ui_send(call, f"❌ <b>Product fetch failed</b>\n\n<code>{html.escape(error[:500])}</code>", parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-            elif call.data == 'licence_hub_import_all':
-                try:
-                    imported_products, imported_plans, skipped, invalid = _licence_hub_import_products(products)
-                    text = (
-                        f"✅ <b>Hub product import complete</b>\n\n"
-                        f"New products: <b>{imported_products}</b>\nMapped plans: <b>{imported_plans}</b>\n"
-                        f"Already mapped/skipped: <b>{skipped}</b>\nInvalid entries: <b>{invalid}</b>\n"
-                        f"Catalogue products received: <b>{len(products)}</b>\n\n"
-                        "New products are hidden by default. Review their prices, then unhide them from Product Hide / Unhide."
-                    )
-                    _admin_ui_send(call, text, parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-                except Exception as exc:
-                    _admin_ui_send(call, f"❌ Import failed: <code>{html.escape(str(exc)[:400])}</code>", parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-            else:
-                state = admin_temp_data.setdefault(user_id, {})
-                state['licence_import_products'] = products
-                state['licence_import_selected'] = []
-                _licence_hub_render_import_select(call, 0)
-
-    elif call.data.startswith('licence_hub_import_page_'):
-        if _is_admin(user_id):
-            try:
-                page = int(call.data.rsplit('_', 1)[-1])
-            except (TypeError, ValueError):
-                page = 0
-            _licence_hub_render_import_select(call, page)
-
-    elif call.data.startswith('licence_hub_pick_'):
-        if _is_admin(user_id):
-            try:
-                raw_id, raw_page = call.data.replace('licence_hub_pick_', '', 1).rsplit('_', 1)
-                external_id, page = str(int(raw_id)), int(raw_page)
-            except (TypeError, ValueError):
-                _licence_hub_callback_answer(call, 'Invalid product selection.', show_alert=True)
-                return
-            state = admin_temp_data.setdefault(user_id, {})
-            products = state.get('licence_import_products') or []
-            if not any(str(row.get('product_id', row.get('id'))) == external_id for row in products if isinstance(row, dict)):
-                _licence_hub_callback_answer(call, 'Product is no longer available.', show_alert=True)
-                return
-            selected = {str(value) for value in state.get('licence_import_selected', [])}
-            if external_id in selected:
-                selected.remove(external_id)
-            else:
-                selected.add(external_id)
-            state['licence_import_selected'] = list(selected)
-            _licence_hub_render_import_select(call, page)
-
-    elif call.data == 'licence_hub_import_selected':
-        if _is_admin(user_id):
-            state = admin_temp_data.get(user_id, {})
-            products = state.get('licence_import_products') or []
-            selected = {str(value) for value in state.get('licence_import_selected', [])}
-            if not selected:
-                _licence_hub_callback_answer(call, 'Select at least one product first.', show_alert=True)
-            else:
-                try:
-                    counts = _licence_hub_import_products(products, selected_ids=selected)
-                    state.pop('licence_import_products', None)
-                    state.pop('licence_import_selected', None)
-                    imported_products, imported_plans, skipped, invalid = counts
-                    _admin_ui_send(
-                        call,
-                        f"✅ <b>Selected import complete</b>\n\nNew products: <b>{imported_products}</b>\nMapped plans: <b>{imported_plans}</b>\nAlready mapped/skipped: <b>{skipped}</b>\nInvalid entries: <b>{invalid}</b>",
-                        parse_mode='HTML', reply_markup=_licence_hub_menu_markup(),
-                    )
-                except Exception as exc:
-                    _admin_ui_send(call, f"❌ Import failed: <code>{html.escape(str(exc)[:400])}</code>", parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-
-    elif call.data == 'licence_hub_reset_products':
-        if _is_admin(user_id):
-            _admin_ui_send(call, '🔄 <b>PRODUCT RESET SERVICES</b>\n\nChoose a product to connect it to one verified service returned by <code>/reset-apis</code>.', parse_mode='HTML', reply_markup=_licence_hub_reset_products_markup())
-
-    elif call.data.startswith('licence_hub_reset_product_'):
-        if _is_admin(user_id):
-            product_name = _licence_hub_reset_product_by_hash(call.data.replace('licence_hub_reset_product_', '', 1))
-            if not product_name:
-                _licence_hub_callback_answer(call, 'Product not found.', show_alert=True)
-            else:
-                admin_temp_data.setdefault(user_id, {})['licence_hub_reset_product'] = product_name
-                prompt = _admin_ui_send(
-                    call,
-                    f"🔄 <b>Set reset service for {html.escape(product_name)}</b>\n\nSend an ID such as <code>10</code> or <code>16:10</code>. It is checked against <code>/reset-apis</code>. Send <code>clear</code> to disconnect.",
-                    parse_mode='HTML',
-                )
-                bot.register_next_step_handler(prompt, step_save_licence_hub_reset_product)
-
-    elif call.data == 'licence_hub_check_reset_all':
-        if _is_admin(user_id):
-            payload, error = _licence_hub_api_request('GET', '/reset-apis', timeout=30)
-            if error:
-                _admin_ui_send(call, f"❌ <b>Reset check failed</b>\n\n<code>{html.escape(error[:400])}</code>", parse_mode='HTML', reply_markup=_licence_hub_reset_products_markup())
-            else:
-                live = {_licence_hub_normalize_reset_id(row.get('reset_id')): row for row in _licence_hub_reset_rows(payload) if isinstance(row, dict) and _licence_hub_normalize_reset_id(row.get('reset_id'))}
-                conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-                try:
-                    mappings = conn.execute('SELECT product_name,reset_id FROM licence_product_reset_settings').fetchall()
-                    lines = []
-                    connected = 0
-                    for product_name, reset_id in mappings:
-                        match = live.get(_licence_hub_normalize_reset_id(reset_id))
-                        verified = int(match is not None)
-                        connected += verified
-                        service_name = str((match or {}).get('name') or (match or {}).get('service_name') or '')
-                        conn.execute('UPDATE licence_product_reset_settings SET service_name=?,verified=?,checked_at=? WHERE product_name=?', (service_name, verified, _now_ist_text(), product_name))
-                        lines.append(f"{'✅' if verified else '❌'} {html.escape(str(product_name))} · <code>{html.escape(str(reset_id))}</code>")
-                    conn.commit()
-                finally:
-                    conn.close()
-                text = f"✅ <b>RESET CONNECTION CHECK</b>\n\nConnected: <b>{connected}/{len(mappings)}</b>\n\n" + ('\n'.join(lines[:35]) if lines else 'No product reset services configured.')
-                _admin_ui_send(call, text, parse_mode='HTML', reply_markup=_licence_hub_reset_products_markup())
-
-    elif call.data == 'licence_hub_reset_key':
-        if _is_admin(user_id):
-            payload, error = _licence_hub_api_request('GET', '/reset-apis', timeout=30)
-            if error:
-                _admin_ui_send(call, f"❌ <b>Could not load reset services</b>\n\n<code>{html.escape(error[:400])}</code>", parse_mode='HTML', reply_markup=_licence_hub_menu_markup())
-            else:
-                services = [row for row in _licence_hub_reset_rows(payload) if isinstance(row, dict) and _licence_hub_normalize_reset_id(row.get('reset_id'))]
-                markup = types.InlineKeyboardMarkup(row_width=1)
-                for row in services[:80]:
-                    reset_id = _licence_hub_normalize_reset_id(row.get('reset_id'))
-                    service_name = str(row.get('name') or row.get('service_name') or reset_id)
-                    markup.add(_admin_colorful_button(f'{service_name} · {reset_id}'[:64], callback_data=f'licence_hub_key_reset_service_{reset_id}', color='blue'))
-                markup.add(_admin_colorful_button('🔙 Licence Manager Hub', callback_data='licence_hub', color='red'))
-                _admin_ui_send(call, '🔑 <b>ADMIN RESET KEY</b>\n\nSelect the service returned by <code>/reset-apis</code>.', parse_mode='HTML', reply_markup=_ensure_admin_back_button(markup))
-
-    elif call.data.startswith('licence_hub_key_reset_service_'):
-        if _is_admin(user_id):
-            reset_id = _licence_hub_normalize_reset_id(call.data.replace('licence_hub_key_reset_service_', '', 1))
-            payload, error = _licence_hub_api_request('GET', '/reset-apis', timeout=30)
-            live = {_licence_hub_normalize_reset_id(row.get('reset_id')) for row in _licence_hub_reset_rows(payload) if isinstance(row, dict) and _licence_hub_normalize_reset_id(row.get('reset_id'))} if not error else set()
-            if not reset_id or reset_id not in live:
-                _licence_hub_callback_answer(call, 'Reset service is no longer available.', show_alert=True)
-            else:
-                admin_temp_data.setdefault(user_id, {})['licence_hub_admin_reset_id'] = reset_id
-                prompt = _admin_ui_send(call, f'🔑 <b>Send the licence key to reset</b>\n\nReset ID: <code>{html.escape(reset_id)}</code>', parse_mode='HTML')
-                bot.register_next_step_handler(prompt, step_licence_hub_admin_reset_key)
-
-    elif call.data == 'licence_hub_toggle_user_reset':
-        if _is_admin(user_id):
-            enabled = not _licence_hub_resets_enabled()
-            set_setting('licence_reset_enabled', '1' if enabled else '0')
-            _licence_hub_callback_answer(call, f"User reset {'enabled' if enabled else 'disabled'}.")
-            _licence_hub_screen(call)
 
     elif call.data == "api_srv_add":
         if _is_admin(user_id):
@@ -18596,7 +16965,16 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
             if account_user_id:
                 identity_parts.append(f"ID {html.escape(str(account_user_id))}")
             identity_line = f"👤 <b>Reseller:</b> {' · '.join(identity_parts)}\n" if identity_parts else ""
-            markup = _api_server_actions_markup(sid)
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                _admin_colorful_button("⚙️ Configure Hacks", callback_data=f"api_hacks_{sid}", color="blue"),
+                _admin_colorful_button("🔍 Check Connection", callback_data=f"api_check_{sid}", color="green"),
+            )
+            markup.add(
+                _admin_colorful_button("✏️ Edit Server", callback_data=f"api_edit_{sid}", color="blue"),
+                _admin_colorful_button("🗑️ Delete Server", callback_data=f"api_delete_{sid}", color="red"),
+            )
+            markup.add(_admin_colorful_button("🔙 API Servers", callback_data="new_server_api", color="red"))
             _admin_ui_send(call,
                 
                 f"🆕 <b>{html.escape(name)}</b>\n\n"
@@ -18703,63 +17081,32 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
             else:
                 bot.answer_callback_query(call.id, "Server not found.", show_alert=True)
 
-    elif call.data.startswith(("api_test_", "api_check_")):
+    elif call.data.startswith("api_check_"):
         if _is_admin(user_id):
-            prefix = "api_test_" if call.data.startswith("api_test_") else "api_check_"
             try:
-                sid = int(call.data[len(prefix):])
+                sid = int(call.data.replace("api_check_", "", 1))
             except ValueError:
                 return
             ok, detail = _api_server_test_connection(sid)
-            bot.answer_callback_query(
-                call.id,
-                "Connection successful!" if ok else "Connection test failed.",
-                show_alert=True,
-            )
+            bot.answer_callback_query(call.id, "Connected Successfully!" if ok else "Not Connect", show_alert=True)
             row = _api_server_row(sid)
             if row:
-                status = "Connection Successful" if ok else "Connection Failed"
+                status = "🟢 <b>Connected Successfully!</b>" if ok else "🔴 <b>Not Connect</b>"
                 identity_parts = []
                 if len(row) > 7 and row[7]:
                     identity_parts.append(html.escape(str(row[7])))
                 if len(row) > 8 and row[8]:
-                    identity_parts.append("@" + html.escape(str(row[8]).lstrip("@")))
+                    identity_parts.append('@' + html.escape(str(row[8]).lstrip('@')))
                 if len(row) > 9 and row[9]:
-                    identity_parts.append("ID " + html.escape(str(row[9])))
-                identity_line = f"Reseller: {' | '.join(identity_parts)}\n" if identity_parts else ""
-                connected_line = f"Last connected: {html.escape(str(row[6]))}\n" if len(row) > 6 and row[6] else ""
-                _admin_ui_send(
-                    call,
-                    f"<b>{status}</b>\n\nServer: <b>{html.escape(str(row[1]))}</b>\n"
-                    f"URL: <code>{html.escape(str(row[3]))}</code>\n"
-                    f"{identity_line}{connected_line}"
-                    f"Response: <code>{html.escape(str(detail)[:500])}</code>",
-                    parse_mode="HTML",
-                    reply_markup=_api_server_actions_markup(sid),
-                )
-
-    elif call.data.startswith("api_balance_"):
-        if _is_admin(user_id):
-            try:
-                sid = int(call.data.replace("api_balance_", "", 1))
-            except ValueError:
-                return
-            ok, detail = _api_server_check_balance(sid)
-            bot.answer_callback_query(
-                call.id,
-                "Balance fetched." if ok else "Balance check failed.",
-                show_alert=True,
-            )
-            row = _api_server_row(sid)
-            if row:
-                status = "Balance check complete" if ok else "Balance check failed"
-                _admin_ui_send(
-                    call,
-                    f"<b>{status}: {html.escape(str(row[1]))}</b>\n\n"
-                    f"URL: <code>{html.escape(str(row[3]))}</code>\n"
-                    f"{html.escape(str(detail)[:500])}",
-                    parse_mode="HTML",
-                    reply_markup=_api_server_actions_markup(sid),
+                    identity_parts.append('ID ' + html.escape(str(row[9])))
+                identity_line = f"👤 <b>Reseller:</b> {' · '.join(identity_parts)}\n" if identity_parts else ""
+                connected_line = f"🕒 <b>Connected:</b> {html.escape(str(row[6]))}\n" if len(row) > 6 and row[6] else ""
+                _admin_ui_send(call,
+                    
+                    f"{status}\n\n🌐 <b>{html.escape(row[1])}</b>\n"
+                    f"🔗 <code>{html.escape(row[3])}</code>\n"
+                    f"{identity_line}{connected_line}",
+                    parse_mode="HTML"
                 )
 
     elif call.data.startswith("api_hacks_"):
@@ -18906,105 +17253,6 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
             _admin_ui_send(fake,
                 f"📦 <b>{html.escape(str(plan[1]))}</b>\n\nPlan <b>{html.escape(str(plan[3]))}</b> is now {'🔴 HIDDEN' if new_state else '🟢 VISIBLE'}.",
                 parse_mode='HTML', reply_markup=_product_visibility_markup(str(plan[1])))
-
-    elif call.data == 'banti_api_system':
-        if _is_admin(user_id):
-            _send_banti_panel(call)
-
-    elif call.data == 'banti_set_token':
-        if _is_admin(user_id):
-            admin_temp_data[user_id] = {}
-            m = _admin_ui_send(call, f'🔑 <b>Enter {html.escape(_banti_name())} API Token:</b>', parse_mode='HTML')
-            bot.register_next_step_handler(m, step_save_banti_token)
-
-    elif call.data == 'banti_edit_token':
-        if _is_admin(user_id):
-            m = _admin_ui_send(call, '✏️ <b>Enter new Banti API Token:</b>', parse_mode='HTML')
-            bot.register_next_step_handler(m, step_edit_banti_token)
-
-    elif call.data == 'banti_edit_url':
-        if _is_admin(user_id):
-            m = _admin_ui_send(call, '🌐 <b>Enter new Banti Server Link:</b>\n\nExample: <code>https://bantibhaiya.to/api/reseller_v1.php</code>', parse_mode='HTML')
-            bot.register_next_step_handler(m, step_edit_banti_url)
-
-    elif call.data == 'banti_edit_name':
-        if _is_admin(user_id):
-            m = _admin_ui_send(call, '✏️ <b>Enter new name for this API system:</b>', parse_mode='HTML')
-            bot.register_next_step_handler(m, step_edit_banti_name)
-
-    elif call.data == 'banti_edit_master':
-        if _is_admin(user_id):
-            m = _admin_ui_send(call, '🔐 <b>Enter Banti Master Key</b> (x-master-key):', parse_mode='HTML')
-            bot.register_next_step_handler(m, step_edit_banti_master)
-
-    elif call.data == 'banti_check':
-        if _is_admin(user_id):
-            ok, detail, _ = _banti_check_connection()
-            bot.answer_callback_query(call.id, ('Connected Successfully!' if ok else 'Not Connected') + f'\n{str(detail)[:150]}', show_alert=True)
-            _send_banti_panel(call)
-
-    elif call.data == 'banti_products':
-        if _is_admin(user_id):
-            _admin_ui_send(call,
-                '🎮 <b>BANTI — CONNECT HACK</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
-                'Tap a hack, set its Product ID and plan Valid IDs, then enable Banti for it.\n'
-                '🟢 = delivered by Banti · ⚪ = previous server',
-                parse_mode='HTML', reply_markup=_banti_products_markup())
-
-    elif call.data.startswith('banti_hack_'):
-        if _is_admin(user_id):
-            product_name = _banti_product_by_hash(call.data.replace('banti_hack_', '', 1))
-            if not product_name:
-                return
-            view, markup = _banti_hack_view(product_name)
-            _admin_ui_send(call, view, parse_mode='HTML', reply_markup=markup)
-
-    elif call.data.startswith('banti_toggle_'):
-        if _is_admin(user_id):
-            product_name = _banti_product_by_hash(call.data.replace('banti_toggle_', '', 1))
-            if not product_name:
-                return
-            new_state = not _banti_product_enabled(product_name)
-            if new_state:
-                if not _banti_connected():
-                    bot.answer_callback_query(call.id, 'Connect Banti API first (token + link).', show_alert=True)
-                    return
-                if not _banti_product_id(product_name):
-                    bot.answer_callback_query(call.id, 'Set the Product ID first.', show_alert=True)
-                    return
-            _set_banti_product_enabled(product_name, new_state)
-            bot.answer_callback_query(call.id, 'Banti ON — previous server on hold' if new_state else 'Banti OFF — previous server restored')
-            view, markup = _banti_hack_view(product_name)
-            _admin_ui_send(call, view, parse_mode='HTML', reply_markup=markup)
-
-    elif call.data.startswith('banti_pid_'):
-        if _is_admin(user_id):
-            product_name = _banti_product_by_hash(call.data.replace('banti_pid_', '', 1))
-            if not product_name:
-                return
-            admin_temp_data[user_id] = {'banti_product': product_name}
-            m = _admin_ui_send(call, f'🆔 <b>Enter Banti Product ID (PID) for {html.escape(product_name)}:</b>', parse_mode='HTML')
-            bot.register_next_step_handler(m, step_save_banti_product_id)
-
-    elif call.data.startswith('banti_plan_'):
-        if _is_admin(user_id):
-            parts = call.data.split('_', 3)
-            if len(parts) != 4:
-                return
-            product_name = _banti_product_by_hash(parts[2])
-            try:
-                plan_id = int(parts[3])
-            except ValueError:
-                return
-            plan = {int(x[0]): x for x in get_product_plans(product_name or '')}.get(plan_id)
-            if not product_name or not plan:
-                return
-            admin_temp_data[user_id] = {'banti_product': product_name, 'banti_plan_id': plan_id}
-            m = _admin_ui_send(call,
-                f'🔢 <b>Enter Valid ID for {html.escape(str(plan[2]))}</b>\n\n'
-                'Send the exact Banti duration name, e.g. <code>1 Hours</code>, <code>3 Hours</code>, <code>1 Day</code>, <code>7 Days</code>.',
-                parse_mode='HTML')
-            bot.register_next_step_handler(m, step_save_banti_valid_id)
 
     elif call.data == 'tobix_api_system':
         if _is_admin(user_id):
@@ -19398,6 +17646,68 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
         if _is_admin(user_id):
             msg = _admin_ui_send(call, "🔄 <b>USER RESET PANEL</b>\n\nPlease enter or paste the Telegram User ID you want to reset completely:\n\n<i>This will erase their profile and force them to re-verify phone number on next /start.</i>", parse_mode="HTML")
             bot.register_next_step_handler(msg, step_process_user_reset)
+
+    elif call.data == "admin_reset_all_users":
+        if _is_admin(user_id):
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(types.InlineKeyboardButton("⚠️ YES, RESET ALL USERS & RESELLERS", callback_data="admin_reset_all_users_confirm"))
+            markup.add(types.InlineKeyboardButton("🔙 Cancel / Users & Resellers", callback_data="admin_cat_users"))
+            _admin_ui_send(call,
+                "⚠️ <b>RESET ALL USERS & RESELLERS</b>\n\n"
+                "This clears user/reseller profiles, balances, verification, referral data, purchase history, pending payments, reseller API credentials and per-user prices. "
+                "Products, plans, keys/stock, country catalogs, server/API configuration and bot settings are kept.\n\n"
+                "A recoverable snapshot will be saved first. Use <b>Restore User Data</b> to bring the previous user data back.\n\n"
+                "<b>Continue?</b>", parse_mode="HTML", reply_markup=markup)
+
+    elif call.data == "admin_reset_all_users_confirm":
+        if _is_admin(user_id):
+            try:
+                admin_ids = _user_reset_admin_ids()
+                conn = sqlite3.connect(str(BOT_DB_PATH), timeout=30)
+                try:
+                    if admin_ids:
+                        marks = ",".join("?" for _ in admin_ids)
+                        count = conn.execute(f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({marks})", tuple(sorted(admin_ids))).fetchone()[0]
+                    else:
+                        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                finally:
+                    conn.close()
+                reset_all_users_and_resellers_db()
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton("♻️ Restore User Data", callback_data="admin_restore_all_users"))
+                markup.add(types.InlineKeyboardButton("🔙 Users & Resellers", callback_data="admin_cat_users"))
+                _admin_ui_send(call,
+                    f"✅ <b>ALL USER & RESELLER ACCOUNTS RESET</b>\n\n"
+                    f"Reset accounts: <b>{count}</b>\n"
+                    "When users send /start again, their account will be created from scratch and phone-number validation will run again.\n\n"
+                    "Products, plans, stock/keys, country catalogs and bot settings were kept. Previous user data is saved and can be restored.",
+                    parse_mode="HTML", reply_markup=markup)
+            except Exception as exc:
+                _admin_ui_send(call, "❌ <b>Bulk reset failed.</b> No reset was completed if snapshot creation failed.\n\n"
+                    f"<code>{html.escape(str(exc), quote=False)}</code>", parse_mode="HTML")
+
+    elif call.data == "admin_restore_all_users":
+        if _is_admin(user_id):
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(types.InlineKeyboardButton("♻️ CONFIRM RESTORE USER DATA", callback_data="admin_restore_all_users_confirm"))
+            markup.add(types.InlineKeyboardButton("🔙 Cancel / Users & Resellers", callback_data="admin_cat_users"))
+            _admin_ui_send(call,
+                "♻️ <b>RESTORE USER DATA</b>\n\n"
+                "This will restore the saved user/reseller accounts, balances, verification records, purchase/payment history, reseller API credentials, custom prices and prior coupon usage. "
+                "Product/catalog/server settings will remain as they are now.\n\nContinue?",
+                parse_mode="HTML", reply_markup=markup)
+
+    elif call.data == "admin_restore_all_users_confirm":
+        if _is_admin(user_id):
+            try:
+                restore_all_users_and_resellers_db()
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton("🔙 Users & Resellers", callback_data="admin_cat_users"))
+                _admin_ui_send(call, "✅ <b>User and reseller data restored successfully.</b>\nProducts, plans, country catalogs and bot settings were not changed.",
+                               parse_mode="HTML", reply_markup=markup)
+            except Exception as exc:
+                _admin_ui_send(call, "❌ <b>Restore failed.</b>\n\n"
+                    f"<code>{html.escape(str(exc), quote=False)}</code>", parse_mode="HTML")
 
     elif call.data == "noop":
         bot.answer_callback_query(call.id)
@@ -21326,7 +19636,7 @@ for _name,_fn in list(globals().items()):
             def _wrapped(message,*args,**kwargs):
                 if _handle_admin_escape_message(message): return
                 return original(message,*args,**kwargs)
-            _wrapped.__name__=getattr(original,'__name__','step_handler'); setattr(_wrapped,'_escape_wrapped',True)
+            _wrapped.__name__=getattr(original,'__name__','step_handler'); _wrapped._escape_wrapped=True
             return _wrapped
         globals()[_name]=_make_escape_wrapper(_fn)
 
@@ -21343,13 +19653,8 @@ def acquire_single_instance_lock():
     global _poll_lock_file
     try:
         import fcntl
-        flock = getattr(fcntl, 'flock', None)
-        lock_ex = getattr(fcntl, 'LOCK_EX', None)
-        lock_nb = getattr(fcntl, 'LOCK_NB', None)
-        if not callable(flock) or lock_ex is None or lock_nb is None:
-            return True
         _poll_lock_file = open(_POLL_LOCK_PATH, "w")
-        flock(_poll_lock_file.fileno(), lock_ex | lock_nb)
+        fcntl.flock(_poll_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         _poll_lock_file.write(str(os.getpid()))
         _poll_lock_file.flush()
         return True
